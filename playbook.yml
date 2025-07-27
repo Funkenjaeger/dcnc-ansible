@@ -61,6 +61,19 @@
         masked: yes
       ignore_errors: yes
 
+    - name: disable initramfs automatic updates
+      ansible.builtin.lineinfile:
+        path: /etc/initramfs-tools/update-initramfs.conf
+        regexp: "^update_initramfs="
+        line: "update_initramfs=no"
+        backup: yes
+
+    - name: update package lists and upgrade system
+      ansible.builtin.shell:
+        cmd: "apt update && apt upgrade -y"
+      register: apt_upgrade_result
+      changed_when: "'upgraded' in apt_upgrade_result.stdout"
+
     - name: install required packages
       ansible.builtin.apt:
         name:

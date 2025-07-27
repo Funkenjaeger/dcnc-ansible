@@ -18,7 +18,7 @@ Comprehensive Ansible automation for setting up a complete LinuxCNC workstation 
 
 ## Overview
 
-This 235-line playbook transforms a fresh Debian system into a fully configured LinuxCNC workstation with:
+This playbook transforms a fresh Debian system into a fully configured LinuxCNC workstation with:
 - Smart VNC remote access with conditional password handling
 - Automated backup systems (Timeshift + Back in Time)
 - Desktop environment configuration (Cinnamon)
@@ -34,6 +34,8 @@ This 235-line playbook transforms a fresh Debian system into a fully configured 
 - **🛡️ System Hardening**: Kernel hold, service management, security configurations
 - **🌐 Remote Access**: x11vnc with Avahi discovery for easy connection
 - **📂 Config Restoration**: Automatically restores backup configurations from existing snapshots
+- **🛠️ Initramfs Management**: Disables automatic updates to prevent system instability
+- **⬆️ Package Management**: Automated apt updates and upgrades with proper sequencing
 
 ## Quick Start
 
@@ -68,32 +70,36 @@ ansible-playbook -i inventory.ini playbook.yml --ask-become-pass
 8. **disable brltty service** - Stop/mask brltty (interferes with USB devices)
 9. **disable brltty-udev service** - Stop/mask brltty-udev service
 
+### 🛠️ System Hardening & Updates
+10. **disable initramfs automatic updates** - Set `update_initramfs=no` to prevent boot issues
+11. **update package lists and upgrade system** - Run `apt update && apt upgrade -y` safely
+
 ### 📦 Package Installation
-10. **install required packages** - Install: git, pipx, timeshift, backintime-qt, cinnamon, x11vnc
-11. **install adafruit-io with pipx** - Python package installation with dependencies
+12. **install required packages** - Install: git, pipx, timeshift, backintime-qt, cinnamon, x11vnc
+13. **install adafruit-io with pipx** - Python package installation with dependencies
 
 ### 🖥️ Desktop Environment Setup
-12. **set cinnamon as default session manager** - Configure lightdm for Cinnamon
-13. **disable screensaver in cinnamon** - Turn off screen lock
-14. **disable screensaver idle activation** - Prevent idle screen activation
-15. **set screen to turn off after 1 hour** - Power management configuration
+14. **set cinnamon as default session manager** - Configure lightdm for Cinnamon
+15. **disable screensaver in cinnamon** - Turn off screen lock
+16. **disable screensaver idle activation** - Prevent idle screen activation
+17. **set screen to turn off after 1 hour** - Power management configuration
 
 ### 🌐 Remote Access (VNC)
-16. **create x11vnc password file** - Generate encrypted password file (conditional)
-17. **create x11vnc systemd service** - Install VNC server service with Avahi discovery
-18. **enable and start x11vnc service** - Activate remote desktop access
+18. **create x11vnc password file** - Generate encrypted password file (conditional)
+19. **create x11vnc systemd service** - Install VNC server service with Avahi discovery
+20. **enable and start x11vnc service** - Activate remote desktop access
 
 ### 🔄 Backup Systems Configuration
-19. **configure timeshift backup device** - Set RSYNC mode with `/dev/sda5`
-20. **create timeshift configuration file** - Full config: 6 monthly, 3 weekly, 3 daily snapshots
-21. **ensure timeshift cron job is active** - Activate scheduled system snapshots
+21. **configure timeshift backup device** - Set RSYNC mode with `/dev/sda5`
+22. **create timeshift configuration file** - Full config: 6 monthly, 3 weekly, 3 daily snapshots
+23. **ensure timeshift cron job is active** - Activate scheduled system snapshots
 
 ### 📂 Back in Time Restoration
-22. **find latest backintime snapshot** - Locate most recent backup in `/backup/backintime/`
-23. **restore backintime config from latest backup** - Restore user backup configuration
+24. **find latest backintime snapshot** - Locate most recent backup in `/backup/backintime/`
+25. **restore backintime config from latest backup** - Restore user backup configuration
 
 ### ⚙️ Development Environment
-24. **clone Funkenjaeger/fj-lcnc-cfg repo** - Install LinuxCNC configuration to `~/linuxcnc`
+26. **clone Funkenjaeger/fj-lcnc-cfg repo** - Install LinuxCNC configuration to `~/linuxcnc`
 
 ## Configuration Details
 
@@ -113,21 +119,27 @@ ansible-playbook -i inventory.ini playbook.yml --ask-become-pass
 - **Display**: 1-hour screen timeout for CNC work
 - **Session**: Configured as default in lightdm
 
+### System Hardening
+- **Kernel Management**: RT kernel packages held to prevent breaking updates
+- **Initramfs**: Automatic updates disabled to prevent boot issues
+- **Services**: brltty services disabled (interfere with USB devices)
+- **Updates**: Safe upgrade process after system hardening
+
 ## File Structure
 
 ```
 dcnc-ansible/
 ├── README.md           # This file
-├── playbook.yml        # Main Ansible playbook (235 lines)
+├── playbook.yml        # Main Ansible playbook
 ├── inventory.ini       # Inventory configuration
 └── .gitignore         # Git ignore rules
 ```
 
 ## Task Execution Summary
 
-- **Total Tasks**: 24 tasks + 3 handlers
+- **Total Tasks**: 26 tasks + 3 handlers
 - **Conditional Tasks**: 5 VNC-related tasks (skipped when password file exists)
-- **Typical Execution**: ~19 active tasks on configured systems
+- **Typical Execution**: ~21 active tasks on configured systems
 - **Handlers**: lightdm restart, systemd reload, x11vnc restart
 
 ## Key Features
@@ -137,6 +149,7 @@ dcnc-ansible/
 ✅ **Comprehensive Automation** - Complete workstation setup from scratch  
 ✅ **Backup Integration** - Both system (Timeshift) and user data (Back in Time)  
 ✅ **Security-First Design** - Encrypted passwords, secure prompting  
+✅ **System Hardening** - Kernel holds, initramfs management, safe upgrades  
 ✅ **Production Ready** - Handles services, dependencies, and error conditions
 
 ## Hardware Requirements
@@ -151,6 +164,7 @@ dcnc-ansible/
 - **VNC Connection**: Ensure port 5900 is open in firewall
 - **Backup Failures**: Verify `/dev/sda5` is mounted and writable
 - **Service Issues**: Check systemd service status with `systemctl status x11vnc`
+- **Boot Issues**: If initramfs updates cause problems, they're now disabled by default
 
 ### Debug Mode
 Run with verbose output:
@@ -168,7 +182,7 @@ ansible-playbook -i inventory.ini playbook.yml --ask-become-pass -vvv
 
 ## License
 
-This project is open source under the MIT license.
+This project is open source. Feel free to use, modify, and distribute according to your needs.
 
 ## Related Projects
 
