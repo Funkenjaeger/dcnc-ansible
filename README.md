@@ -10,6 +10,9 @@ Warnings:
 - This assumes there's a dedicated partition for backups with mount point /backup at /dev/sda5 that should be persisted through system reinstallations.
 - DO NOT do an ```apt upgrade``` prior to running this playbook.  It will break, and one of the things this playbook does is mitigate that.
 
+To Do:
+- Currently the UUID of the backup partition is hard-coded in the playbook.  make it not.
+
 ## Summary
 Comprehensive Ansible automation for setting up a complete LinuxCNC workstation with desktop environment, backup systems, remote access, and development tools.
 
