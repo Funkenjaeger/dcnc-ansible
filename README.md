@@ -39,6 +39,18 @@ This playbook transforms a fresh Debian system into a fully configured LinuxCNC 
 
 ## Quick Start
 
+### Install Ansible
+
+On Debian/Ubuntu:
+```bash
+sudo apt update
+sudo apt install ansible
+```
+
+On other systems, see the [official Ansible installation guide](https://docs.ansible.com/ansible/latest/installation_guide/intro_installation.html).
+
+### Run the Playbook
+
 ```bash
 # Clone the repository
 git clone git@github.com:Funkenjaeger/dcnc-ansible.git
