@@ -74,6 +74,37 @@
       register: apt_upgrade_result
       changed_when: "'upgraded' in apt_upgrade_result.stdout"
 
+    - name: check if any interface has IP 10.10.10.11
+      ansible.builtin.shell:
+        cmd: "ip addr show | grep -q '10.10.10.11/'"
+      register: mesa_ip_check
+      failed_when: false
+      changed_when: false
+
+    - name: get available ethernet interfaces
+      ansible.builtin.shell:
+        cmd: "ip link show | awk '$2 ~ /^(eth|enp|ens)/ {gsub(/:/, \"\", $2); print $2}'"
+      register: ethernet_interfaces
+      when: mesa_ip_check.rc != 0
+      changed_when: false
+
+    - name: prompt for ethernet interface selection
+      ansible.builtin.pause:
+        prompt: |
+          Available ethernet interfaces:
+          {{ ethernet_interfaces.stdout_lines | join("\n") }}
+          
+          Select the interface to configure for Mesa (10.10.10.11):
+      register: selected_interface
+      when: mesa_ip_check.rc != 0 and ethernet_interfaces.stdout_lines | length > 0
+
+    - name: configure selected interface with Mesa IP
+      ansible.builtin.shell:
+        cmd: "nmcli connection add type ethernet con-name mesa ifname {{ selected_interface.user_input }} ipv4.addresses 10.10.10.11/8 ipv4.method manual autoconnect yes"
+      when: mesa_ip_check.rc != 0 and selected_interface.user_input is defined
+      register: mesa_interface_result
+      changed_when: true
+
     - name: install required packages
       ansible.builtin.apt:
         name:
