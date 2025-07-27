@@ -1,5 +1,19 @@
 # LinuxCNC Ansible Playbook
 
+## Human-generated foreword
+Note: apart from this section, this entire readme is AI-generated.  This playbook is meant to provision a fresh installation of LinuxCNC 2.9.4 from the official ISO (Debian 12) to match my own personal preferences.  Yours will undoubtedly differ.  The intent is that immediately after completing the OS installation, the following steps should fully configure the system:
+- ```sudo apt update && sudo apt install -y ansible git```
+- ```cd ~ && git clone https://github.com/Funkenjaeger/dcnc-ansible.git && cd dcnc-ansible```
+- ```ansible-playbook -i inventory.ini playbook.yml --ask-become-pass```
+
+Warnings:
+- This assumes there's a dedicated partition for backups with mount point /backup at /dev/sda5 that should be persisted through system reinstallations.
+- DO NOT do an ```apt upgrade``` prior to running this playbook.  It will break, and one of the things this playbook does is mitigate that.
+
+To Do:
+- Currently the UUID of the backup partition is hard-coded in the playbook.  make it not.
+
+## Summary
 Comprehensive Ansible automation for setting up a complete LinuxCNC workstation with desktop environment, backup systems, remote access, and development tools.
 
 ## Overview
@@ -154,7 +168,7 @@ ansible-playbook -i inventory.ini playbook.yml --ask-become-pass -vvv
 
 ## License
 
-This project is open source. Feel free to use, modify, and distribute according to your needs.
+This project is open source under the MIT license.
 
 ## Related Projects
 
