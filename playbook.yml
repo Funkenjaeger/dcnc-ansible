@@ -1,0 +1,235 @@
+- name: linuxcnc basic
+  hosts: local
+  become: yes
+
+  tasks:
+
+    - name: check if x11vnc password file exists
+      ansible.builtin.stat:
+        path: /etc/x11vnc.pass
+      register: x11vnc_pass_file
+
+    - name: prompt for VNC password if needed
+      ansible.builtin.pause:
+        prompt: "Enter the VNC password"
+        echo: no
+      register: vnc_password_input
+      when: not x11vnc_pass_file.stat.exists
+
+    - name: confirm VNC password if needed
+      ansible.builtin.pause:
+        prompt: "Confirm the VNC password"
+        echo: no
+      register: vnc_password_confirm
+      when: not x11vnc_pass_file.stat.exists
+
+    - name: verify VNC passwords match
+      ansible.builtin.fail:
+        msg: "VNC passwords do not match!"
+      when: 
+        - not x11vnc_pass_file.stat.exists
+        - vnc_password_input.user_input != vnc_password_confirm.user_input
+
+    - name: set VNC password variable
+      ansible.builtin.set_fact:
+        vnc_password: "{{ vnc_password_input.user_input }}"
+      when: not x11vnc_pass_file.stat.exists
+
+    - name: linux-image-6.1.0-30-rt-amd64
+      ansible.builtin.dpkg_selections:
+        name: linux-image-6.1.0-30-rt-amd64
+        selection: hold
+
+    - name: linux-image-rt-amd64
+      ansible.builtin.dpkg_selections:
+        name: linux-image-rt-amd64
+        selection: hold
+
+    - name: disable brltty service
+      ansible.builtin.systemd:
+        name: brltty
+        enabled: no
+        state: stopped
+        masked: yes
+      ignore_errors: yes
+
+    - name: disable brltty-udev service
+      ansible.builtin.systemd:
+        name: brltty-udev
+        enabled: no
+        state: stopped
+        masked: yes
+      ignore_errors: yes
+
+    - name: install required packages
+      ansible.builtin.apt:
+        name:
+          - git
+          - pipx
+          - timeshift
+          - backintime-qt
+          - cinnamon
+          - x11vnc
+        state: present
+        update_cache: yes
+
+    - name: install adafruit-io with pipx
+      ansible.builtin.command:
+        cmd: pipx install --include-deps adafruit-io
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+      register: pipx_result
+      changed_when: "'installed package' in pipx_result.stdout"
+      failed_when: pipx_result.rc != 0 and 'already installed' not in pipx_result.stderr
+
+    - name: set cinnamon as default session manager
+      ansible.builtin.lineinfile:
+        path: /etc/lightdm/lightdm.conf
+        regexp: '^#?user-session='
+        line: 'user-session=cinnamon'
+        backup: yes
+      notify: restart lightdm
+
+    - name: disable screensaver in cinnamon
+      ansible.builtin.command:
+        cmd: gsettings set org.cinnamon.desktop.screensaver lock-enabled false
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+      changed_when: false
+
+    - name: disable screensaver idle activation
+      ansible.builtin.command:
+        cmd: gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+      changed_when: false
+
+    - name: set screen to turn off after 1 hour
+      ansible.builtin.command:
+        cmd: gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-ac 3600
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+      changed_when: false
+
+    - name: create x11vnc password file
+      ansible.builtin.shell:
+        cmd: 'printf "{{ vnc_password }}\n{{ vnc_password }}\n" | x11vnc -storepasswd /etc/x11vnc.pass'
+      args:
+        creates: "/etc/x11vnc.pass"
+      changed_when: false
+      when: not x11vnc_pass_file.stat.exists
+
+    - name: create x11vnc systemd service
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description="x11vnc"
+          Requires=display-manager.service
+          After=display-manager.service
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=simple
+          ExecStart=x11vnc -xkb -noxrecord -noxfixes -noxdamage -display :0 -rfbport 5900 -auth guess -rfbauth /etc/x11vnc.pass -forever -avahi
+          ExecStop=/usr/bin/killall x11vnc
+          Restart=on-failure
+          Restart-sec=2
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/x11vnc.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart x11vnc
+
+    - name: enable and start x11vnc service
+      ansible.builtin.systemd:
+        name: x11vnc
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: configure timeshift backup device
+      ansible.builtin.command:
+        cmd: timeshift --snapshot-device /dev/sda5 --rsync
+      changed_when: false
+
+    - name: create timeshift configuration file
+      ansible.builtin.copy:
+        content: |
+          {
+            "backup_device_uuid" : "72a5badb-5b72-4747-9dd0-b6ba278949da",
+            "parent_device_uuid" : "",
+            "do_first_run" : "false",
+            "btrfs_mode" : "false",
+            "include_btrfs_home_for_backup" : "false",
+            "include_btrfs_home_for_restore" : "false",
+            "stop_cron_emails" : "true",
+            "schedule_monthly" : "true",
+            "schedule_weekly" : "true",
+            "schedule_daily" : "true",
+            "schedule_hourly" : "false",
+            "schedule_boot" : "false",
+            "count_monthly" : "6",
+            "count_weekly" : "3",
+            "count_daily" : "3",
+            "count_hourly" : "6",
+            "count_boot" : "5",
+            "date_format" : "%Y-%m-%d %H:%M:%S",
+            "exclude" : [
+              "/home/evand/**"
+            ],
+            "exclude-apps" : []
+          }
+        dest: /etc/timeshift/timeshift.json
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+
+    - name: ensure timeshift cron job is active
+      ansible.builtin.command:
+        cmd: timeshift --check
+      changed_when: false
+
+    - name: find latest backintime snapshot
+      ansible.builtin.shell:
+        cmd: 'find /backup/backintime/backintime/cncpc/evand/1/ -maxdepth 1 -type d -name "*-*" | sort | tail -1'
+      register: latest_snapshot
+      changed_when: false
+
+    - name: restore backintime config from latest backup
+      ansible.builtin.copy:
+        src: "{{ latest_snapshot.stdout }}/backup/home/evand/.config/backintime/config"
+        dest: "/home/evand/.config/backintime/config"
+        owner: evand
+        group: evand
+        mode: '0644'
+        backup: yes
+      when: latest_snapshot.stdout != ""
+      become: no
+
+    - name: clone Funkenjaeger/fj-lcnc-cfg repo
+      ansible.builtin.git:
+        repo: https://github.com/Funkenjaeger/fj-lcnc-cfg.git
+        dest: "~/linuxcnc"
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
+  handlers:
+    - name: restart lightdm
+      ansible.builtin.systemd:
+        name: lightdm
+        state: restarted
+
+    - name: reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: restart x11vnc
+      ansible.builtin.systemd:
+        name: x11vnc
+        state: restarted
