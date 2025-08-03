@@ -109,7 +109,6 @@
       ansible.builtin.apt:
         name:
           - git
-          - pipx
           - timeshift
           - backintime-qt
           - cinnamon
@@ -117,14 +116,6 @@
         state: present
         update_cache: yes
 
-    - name: install adafruit-io with pipx
-      ansible.builtin.command:
-        cmd: pipx install --include-deps adafruit-io
-      become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
-      register: pipx_result
-      changed_when: "'installed package' in pipx_result.stdout"
-      failed_when: pipx_result.rc != 0 and 'already installed' not in pipx_result.stderr
 
     - name: set cinnamon as default session manager
       ansible.builtin.lineinfile:
@@ -270,6 +261,31 @@
       ansible.builtin.git:
         repo: https://github.com/Funkenjaeger/fj-lcnc-cfg.git
         dest: "~/linuxcnc"
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
+    - name: check if virtual environment exists
+      ansible.builtin.stat:
+        path: /usr/local/venv/linuxcnc_venv/bin/activate
+      register: venv_exists
+
+    - name: create directory for virtual environment
+      ansible.builtin.file:
+        path: /usr/local/venv
+        state: directory
+        owner: "{{ ansible_env.USER | default(ansible_user_id) }}"
+        mode: '0755'
+      when: not venv_exists.stat.exists
+
+    - name: create python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv /usr/local/venv/linuxcnc_venv
+      when: not venv_exists.stat.exists
+
+    - name: install adafruit-io requirements
+      ansible.builtin.pip:
+        requirements: ~/linuxcnc/configs/DCNC/requirements.txt
+        virtualenv: /usr/local/venv/linuxcnc_venv
       become: no
       become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
 
