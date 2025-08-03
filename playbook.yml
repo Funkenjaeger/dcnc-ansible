@@ -256,6 +256,16 @@
       when: latest_snapshot.stdout != ""
       become: no
 
+    - name: copy udev rules for imach-p4s
+      ansible.builtin.copy:
+        src: files/99-imach-p4s.rules
+        dest: /etc/udev/rules.d/99-imach-p4s.rules
+        owner: root
+        group: root
+        mode: '0644'
+        backup: yes
+      notify: reload udev rules
+
     - name: clone Funkenjaeger/fj-lcnc-cfg repo
       ansible.builtin.git:
         repo: https://github.com/Funkenjaeger/fj-lcnc-cfg.git
@@ -277,3 +287,7 @@
       ansible.builtin.systemd:
         name: x11vnc
         state: restarted
+
+    - name: reload udev rules
+      ansible.builtin.shell:
+        cmd: udevadm control --reload-rules && udevadm trigger
