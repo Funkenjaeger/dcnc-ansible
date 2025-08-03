@@ -277,6 +277,54 @@
         mode: '0755'
       when: not venv_exists.stat.exists
 
+    - name: check if ADAFRUIT_IO_USERNAME is set
+      ansible.builtin.shell:
+        cmd: echo "${ADAFRUIT_IO_USERNAME:-}"
+      register: existing_username
+      changed_when: false
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
+    - name: check if ADAFRUIT_IO_KEY is set
+      ansible.builtin.shell:
+        cmd: echo "${ADAFRUIT_IO_KEY:-}"
+      register: existing_key
+      changed_when: false
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
+    - name: prompt for Adafruit IO username
+      ansible.builtin.pause:
+        prompt: "Enter your Adafruit IO username"
+      register: adafruit_username_input
+      when: existing_username.stdout == ""
+
+    - name: prompt for Adafruit IO key
+      ansible.builtin.pause:
+        prompt: "Enter your Adafruit IO key"
+      register: adafruit_key_input
+      when: existing_key.stdout == ""
+
+    - name: set ADAFRUIT_IO_USERNAME environment variable
+      ansible.builtin.lineinfile:
+        path: /home/{{ ansible_env.USER | default(ansible_user_id) }}/.bashrc
+        regexp: '^export ADAFRUIT_IO_USERNAME='
+        line: 'export ADAFRUIT_IO_USERNAME="{{ adafruit_username_input.user_input }}"'
+        backup: yes
+      when: existing_username.stdout == ""
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
+    - name: set ADAFRUIT_IO_KEY environment variable
+      ansible.builtin.lineinfile:
+        path: /home/{{ ansible_env.USER | default(ansible_user_id) }}/.bashrc
+        regexp: '^export ADAFRUIT_IO_KEY='
+        line: 'export ADAFRUIT_IO_KEY="{{ adafruit_key_input.user_input }}"'
+        backup: yes
+      when: existing_key.stdout == ""
+      become: no
+      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+
     - name: create python virtual environment
       ansible.builtin.command:
         cmd: python3 -m venv /usr/local/venv/linuxcnc_venv
