@@ -1,0 +1,39 @@
+# dcnc-ansible: files/sudoers.d/90-restic-verify-configs
+# -> /etc/sudoers.d/90-restic-verify-configs (root:root 0440) on cncpc
+#
+# COPIED FROM homelab-ops.git's OWN STAGED PATCH, staged there 2026-08-21 by a
+# sandboxed nightly investigator that could not reach cncpc
+# (scratch/2026-08-21/homelab-ops-cncpc-report-backup-status.patch, still
+# UNAPPLIED to homelab-ops.git main as of 2026-08-22 -- verify it has landed
+# before assuming this file matches). That patch's own header, preserved
+# below, still applies word for word: this file has NOT been confirmed
+# against the live host.
+#
+# UNCONFIRMED #1 -- THE FILENAME. "90-restic-verify-configs" is a naming
+# guess by analogy with dserver/sudoers.d/90-restic, not a transcription of a
+# live file. Nobody has run `sudo ls /etc/sudoers.d/` on cncpc from any
+# sandboxed investigation to date. CONFIRM WITH: ssh cncpc 'sudo ls
+# /etc/sudoers.d/', then rename this file to match exactly, then diff its
+# content against `sudo cat` of the real one -- the same treatment
+# dserver/sudoers.d/90-restic got on 2026-08-03 (see that file's header in
+# homelab-ops.git for the method).
+#
+# UNCONFIRMED #2 -- NOPASSWD. Assumed by analogy with every other
+# wrapper-style grant in homelab-ops.git (dserver's two restic grants,
+# webedge's 91-webedge-snapshot). homelab-ops.git's own README describes
+# restic-verify-configs's invocation only as "evand via sudo, manual",
+# without stating NOPASSWD explicitly. Confirm which is live before trusting
+# this line on a real rebuild.
+#
+# WHY THIS GRANT EXISTS AT ALL: restic-verify-configs (files/restic-verify-
+# configs in this repo, copied verbatim from homelab-ops.git
+# cncpc/restic-verify-configs) re-execs itself into a clean environment as
+# root (HOME=/root) and reads /root/.restic-password -- it must run as root
+# to reach that file, which is why the grant is needed at all.
+evand ALL=(root) NOPASSWD: /usr/local/bin/restic-verify-configs
+
+# NOT included here: any grant for cncpc/report-backup-status.sh (TickTick
+# 6a8706a5's job, not this task's). That script's real body, install path and
+# privilege needs are still unknown from any sandboxed investigation as of
+# 2026-08-22 -- adding a grant for it before its real content is known would
+# be inventing a second unverified fact on top of the first.

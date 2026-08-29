@@ -1,0 +1,240 @@
+#!/bin/bash
+#
+# /usr/local/bin/restic-verify-configs  (cncpc, installed today at that path)
+#
+# Proves cncpc's restic backup round-trips: restores
+# /home/evand/linuxcnc/configs from the latest snapshot into a private temp
+# dir, diffs it against the live directory, prints a verdict, deletes the
+# temp dir. Takes NO ARGUMENTS. See homelab-wiki/docs/hosts/cncpc.md for the
+# retirement-of-BackInTime story this proved.
+#
+# WHY A WRAPPER AND NOT `NOPASSWD: /usr/bin/restic`:
+# restic's rclone backend accepts `-o rclone.program=<cmd>` and EXECUTES it,
+# so a NOPASSWD grant on the restic binary is arbitrary command execution as
+# root -- demonstrated on dserver 2026-08-01 by passing /usr/bin/id and
+# watching restic invoke it. This wrapper never exposes that flag, or any
+# flag, to a caller; the entire restic command line below is a literal.
+#
+# ---------------------------------------------------------------------------
+# THREAT MODEL -- every way this confinement could be bypassed, and the line
+# that blocks it. Written to the same standard as the sibling restic wrapper
+# (dserver's restic-readonly, staged 2026-08-01) since both wrap restic under
+# sudo and share its env-injection surface; this one is simpler because it
+# takes no argument at all, so several of that wrapper's argv-smuggling
+# concerns (flag injection into $1, a second positional argument) do not
+# apply -- there is no argument dispatch surface to attack in the first
+# place, only whether the hardcoded call ever bends to outside influence.
+#
+# 1. Extra arguments (`sudo restic-verify-configs anything`, a trailing `--`,
+#    an empty string).
+#       BLOCKED BY: wc_require_argc 0 "$@" below, checked BEFORE anything
+#       else runs. "$@" is never referenced again after that check --
+#       nothing downstream reads $1 or forwards "$@" to restic.
+#
+# 2. RESTIC_PASSWORD_COMMAND -- restic's own docs describe this as "Command
+#    printing the password for the repository to stdout"
+#    (https://restic.readthedocs.io/en/stable/075_scripting.html). That is
+#    restic voluntarily executing a caller-controlled program AS RESTIC'S OWN
+#    UID -- root, once this runs under sudo. Reachable with no argument to
+#    the wrapper at all, only the environment:
+#        RESTIC_PASSWORD_COMMAND='/bin/sh -c whatever' sudo restic-verify-configs
+#    Whether this reaches restic depends on sudo's env_reset/env_keep config.
+#    `sudo -l` on cncpc (read-only recon, 2026-08-02) shows env_reset already
+#    set, which would already strip it -- but this file does not rely on
+#    that holding, matching the sibling wrapper's reasoning: a repo snapshot
+#    cannot promise a live sudoers file stays that way.
+#       BLOCKED BY: the single unconditional `env -i` hop below, dropping
+#       every inherited variable and rebuilding a minimal environment from
+#       hardcoded values before the PHASE2 logic (which calls restic) ever
+#       runs. Nothing the caller sets survives into that hop -- and there is
+#       no marker/conditional a caller could preset to skip the hop itself
+#       (see the NO SELF-REENTRY note above threat model).
+#
+# 3. RESTIC_REPOSITORY / RESTIC_REPOSITORY_FILE / RESTIC_CACHE_DIR /
+#    RESTIC_KEY_HINT -- same family, same restic docs page. A redirected
+#    repo or cache dir lets a caller point "verify" at data they control, or
+#    (combined with #2/#5) at a repo string that makes restic exec something
+#    caller-chosen.
+#       BLOCKED BY: same env -i re-exec as #2.
+#
+# 4. THE ORIGINAL SCRIPT'S OWN HOLE, found while retrofitting this: the
+#    version hand-installed on cncpc reads
+#        REPO=${CNCPC_RESTIC_REPO:-/mnt/backups/cncpc-restic}
+#    -- an explicit, intentional environment override, apparently meant as
+#    "the one thing that varies by host". But this file is now declared per
+#    host (this IS the cncpc copy), so there is no cross-host case left for
+#    an env override to serve, and every environment variable is caller
+#    input under this wrapper's own threat model (#2 above). Whether it was
+#    ever exploitable in practice depended on the same unverifiable sudo
+#    env_reset question as #2.
+#       FIXED BY: REPO is now a plain hardcoded literal, not an
+#       environment-conditioned default. (It is also moot after the env -i
+#       re-exec regardless, since CNCPC_RESTIC_REPO would not survive that --
+#       but removing the read entirely means there is no expression left to
+#       audit for it, which is the point of rule 4 in wrapper-common.sh.)
+#
+# 5. PATH manipulation -- caller puts a malicious `restic`, `mountpoint`,
+#    `diff`, etc. earlier on PATH than sudo's secure_path, which (like #2)
+#    this file cannot verify stays configured on a live host.
+#       BLOCKED BY: PATH is hardcoded to a fixed value in the env -i re-exec
+#       (verified against cncpc's actual binary locations, 2026-08-02
+#       read-only recon: mountpoint/mktemp/chmod/diff/du/find/sed/head/rm are
+#       all under /usr/bin there). restic specifically is also called by an
+#       absolute, hardcoded path ($RESTIC_BIN) as extra defense-in-depth on
+#       the one binary in this list that can itself spawn another process
+#       (rclone, via `-o rclone.program=`) -- this wrapper never sets that
+#       flag, but the absolute path means even a PATH bypass elsewhere can't
+#       substitute a different restic binary that decides to set it itself.
+#
+# 6. stdin smuggling (piping a script at a wrapper that, like
+#    git-monitor-scan on webedge, might hand stdin to something that
+#    interprets it as code). This wrapper never reads stdin at all.
+#       BLOCKED BY: wc_close_stdin, called before anything else -- makes
+#       "read whatever the caller piped in" structurally impossible rather
+#       than merely unused by convention.
+#
+# 7. PWFILE candidate search (/root/.restic-password, /root/.restic-pass,
+#    /etc/restic/password) -- NOT an attacker-influenced list. All three
+#    candidates are literals in this file; nothing in the environment or
+#    argv can add, remove, or reorder them. The loop exists for host
+#    portability (this convention started before cncpc had settled which
+#    path it uses), not caller convenience, so it is left as-is.
+#
+# NOT in scope for this wrapper: it only ever calls `restic restore latest
+# --include <fixed path>` against a fixed repo. It never calls `backup`,
+# `forget`, `prune`, `unlock`, `init`, `dump`, `find`, or `mount`, and no
+# flag of any kind is exposed to a caller -- the restic command line below is
+# exhaustive, not "allow known-good verbs, block the rest".
+# ---------------------------------------------------------------------------
+#
+# SOURCING NOTE: wrapper-common.sh's four primitives (wc_refuse,
+# wc_close_stdin, wc_require_argc) are inlined below rather than sourced.
+# cncpc does not have homelab-ops cloned onto it -- this file is installed
+# standalone at /usr/local/bin/restic-verify-configs, the same way
+# palworld/palworld-backup-export and opnsense/unbound-localdata are
+# installed standalone on their hosts with nothing else from this repo
+# alongside them. Sourcing a relative ../lib/wrapper-common.sh would only
+# work if that file were ALSO copied to cncpc and kept in lockstep by hand,
+# which is one more moving part than a copy-paste of four small functions.
+# If wrapper-common.sh's implementation changes, update the copy below too;
+# `diff` it against lib/wrapper-common.sh occasionally to catch drift.
+#
+# NO SELF-REENTRY (fixed 2026-08-02, see wc_reexec_clean_env's own comment in
+# lib/wrapper-common.sh for the full writeup): this file used to re-invoke
+# "$0" with an RVC_REEXECED=1 marker to skip straight past the clean-env step
+# on the second pass. A caller could preset that exact marker in their own
+# shell before running `sudo restic-verify-configs` and skip the env -i step
+# entirely -- confirmed by hand against the sibling restic-readonly-wrapper.sh
+# the same day; this file had independently copied the identical shape. Fixed
+# by re-execing into a FRESH bash reading the real logic from a heredoc that
+# is part of THIS file's own source, never independently invokable -- see the
+# single `exec` below. There is no longer anything for a caller to jump to.
+
+set -uo pipefail
+
+# --- begin wrapper-common.sh primitives (copied from lib/wrapper-common.sh,
+# commit c[fixed] -- see SOURCING NOTE above) ------------------------------
+wc_refuse() {
+    printf '%s: %s\n' "${0##*/}" "$1" >&2
+    exit 2
+}
+wc_close_stdin() {
+    exec 0</dev/null
+}
+wc_require_argc() {
+    expected="$1"; shift
+    [ "$#" -eq "$expected" ]
+}
+# --- end wrapper-common.sh primitives -------------------------------------
+
+wc_close_stdin
+wc_require_argc 0 "$@" || wc_refuse "no arguments accepted (this wrapper takes none)"
+
+# Hardcoded PATH for the re-exec below and every bare utility name inside the
+# PHASE2 block (mountpoint, mktemp, chmod, diff, du, find, sed, head, rm) --
+# see threat #5 above.
+SECURE_PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+# ONE unconditional hop: no marker, no conditional, no re-entry into this
+# file. PHASE2's text below is parsed as part of THIS script's own source at
+# read time -- it has no path or name of its own for a caller to invoke
+# directly, so there is nothing to spoof. Everything from here down runs
+# ONLY inside that fresh, already-clean-environment bash.
+#
+# `bash -c "$(cat <<'PHASE2' ... )"`, NOT `bash -s <<'PHASE2'`: passing the
+# script as a `-c` argument (argv), not as bash's own stdin, matters and is
+# not cosmetic -- see wc_reexec_clean_env's "USE bash -c ... NOT bash -s"
+# note in lib/wrapper-common.sh for why. `bash -s` ties bash's OWN script
+# read to fd 0, and the restic call below is a pipeline whose stdin is not
+# explicitly redirected -- any command in that pipeline that touches fd 0
+# would steal bytes bash still needed for its own remaining source and cause
+# a silent, wrong-looking-successful early exit. Found by exactly that
+# symptom while promoting this file: it silently returned exit 0 right after
+# the restic pipeline, every time, no error anywhere.
+exec /usr/bin/env -i PATH="$SECURE_PATH" HOME="/root" /bin/bash -c "$(cat <<'PHASE2'
+set -uo pipefail
+
+wc_refuse() {
+    printf 'restic-verify-configs: %s\n' "$1" >&2
+    exit 2
+}
+
+RESTIC_BIN="/usr/bin/restic"
+REPO="/mnt/backups/cncpc-restic"
+SRC="/home/evand/linuxcnc/configs"
+
+# The one thing that varies by host. Fail LOUDLY rather than silently trying
+# an empty password -- restic would just report "wrong password" and the
+# operator would chase the wrong problem. See threat #7 above: these three
+# candidates are literals, not caller input.
+PWFILE=""
+for c in /root/.restic-password /root/.restic-pass /etc/restic/password; do
+    [ -r "$c" ] && { PWFILE="$c"; break; }
+done
+if [ -z "$PWFILE" ]; then
+    wc_refuse "no password file found. Looked in: /root/.restic-password /root/.restic-pass /etc/restic/password"
+fi
+
+if ! mountpoint -q /mnt/backups; then
+    wc_refuse "/mnt/backups is not mounted — nothing to verify against"
+fi
+
+TMP=$(mktemp -d /tmp/restic-verify.XXXXXX) || exit 2
+trap 'rm -rf "$TMP"' EXIT
+chmod 700 "$TMP"
+
+echo "repo:     $REPO"
+echo "password: $PWFILE"
+echo "source:   $SRC"
+echo
+
+if ! "$RESTIC_BIN" --repo "$REPO" --password-file "$PWFILE" \
+        restore latest --target "$TMP" --include "$SRC" 2>&1 | sed 's/^/  /'; then
+    echo "restic-verify-configs: RESTORE FAILED — backup is not usable" >&2
+    exit 1
+fi
+
+RESTORED="$TMP$SRC"
+if [ ! -d "$RESTORED" ]; then
+    # A restore that "succeeds" and produces nothing is the failure mode that
+    # matters most: it looks green and there is no data.
+    echo "restic-verify-configs: restore produced no $SRC — EMPTY, not clean" >&2
+    exit 1
+fi
+
+echo
+echo "restored $(find "$RESTORED" -type f | wc -l) files, $(du -sh "$RESTORED" | cut -f1)"
+echo "live     $(find "$SRC" -type f | wc -l) files, $(du -sh "$SRC" | cut -f1)"
+echo
+
+if diff -r "$RESTORED" "$SRC" > "$TMP/diff.out" 2>&1; then
+    echo "ROUND-TRIP CLEAN — restic reproduces $SRC byte for byte"
+    exit 0
+else
+    echo "DIFFERS — restic's copy does not match live:"
+    head -40 "$TMP/diff.out" | sed 's/^/  /'
+    echo "  (differences may be legitimate if the directory changed since the last snapshot)"
+    exit 1
+fi
+PHASE2
+)"

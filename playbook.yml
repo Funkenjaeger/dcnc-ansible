@@ -298,6 +298,142 @@
       become: no
       become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
 
+    # ==========================================================================
+    # RESTIC -- disaster-recovery data backup for /home/evand and /etc, added
+    # 2026-08-22 (TickTick 6a81c1ba). PACKAGES artifacts that already exist and
+    # are proven elsewhere; this does not redesign anything already settled.
+    #
+    #   - homelab-wiki docs/hosts/cncpc.md, "Backup design" + "restic"
+    #     sections: restic backup /home/evand /etc --exclude-caches; restic
+    #     forget --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune; root
+    #     cron 01:00 backup + Sunday 04:00 prune; RESTIC_PASSWORD_FILE=
+    #     /root/.restic-password mode 0600; repo /mnt/backups/cncpc-restic, an
+    #     NFS mount of 192.168.1.143:/volume1/backups, a SIBLING of the rsync
+    #     target /mnt/backups/cncpc -- never a child, or rsync_backup.sh's
+    #     --delete removes the repo nightly. Restore proven 2026-08-01,
+    #     snapshot 31cfa91e, 99 files / 13 MB byte-for-byte.
+    #   - homelab-ops.git main:cncpc/restic-verify-configs (commit 7203a652,
+    #     2026-08-16) -- already versioned there and already deployed to
+    #     /usr/local/bin on cncpc, root:root 0755. files/restic-verify-configs
+    #     in this repo is a VERBATIM copy of that file; see its own
+    #     threat-model header for why it is a wrapper and not a bare
+    #     `NOPASSWD: /usr/bin/restic` grant.
+    #   - files/sudoers.d/90-restic-verify-configs is copied from
+    #     homelab-ops.git's OWN STAGED, UNAPPLIED patch
+    #     (scratch/2026-08-21/homelab-ops-cncpc-report-backup-status.patch) --
+    #     both the filename and the NOPASSWD-ness are UNCONFIRMED against the
+    #     live host. See that file's header before trusting this on a real
+    #     rebuild.
+    #
+    # NOT covered here, deliberately:
+    #   - cncpc/report-backup-status.sh and the cncpc-status.json it feeds --
+    #     TickTick 6a8706a5's job, still a placeholder as of 2026-08-22.
+    #   - The Timeshift/BackInTime DROP (5 tasks) + SPLIT (1 task) this task's
+    #     own body scopes at playbook.yml:112-113,175-209 -- left untouched
+    #     tonight so this patch is purely additive.
+    #   - A weekly restic integrity check (--read-data-subset, as dserver's
+    #     restic-backup.sh runs) -- not documented anywhere for cncpc, so not
+    #     invented here; see files/cncpc-restic-backup.sh's own header.
+    #
+    # NOT SYNTAX-CHECKED: no `ansible` binary is available in the sandbox that
+    # staged this (`which ansible ansible-playbook` -> not found). This is
+    # staged, reviewed-by-reading YAML, not proven-by-running YAML.
+
+    - name: install restic
+      ansible.builtin.apt:
+        name: restic
+        state: present
+        update_cache: yes
+
+    - name: mount cncpc-restic NFS share
+      ansible.posix.mount:
+        path: /mnt/backups
+        src: "192.168.1.143:/volume1/backups"
+        fstype: nfs4
+        opts: defaults
+        state: mounted
+      # VERIFY OPTS AGAINST THE LIVE /etc/fstab BEFORE A REAL REBUILD.
+      # "defaults" is not a transcription of the live mount line -- no SSH is
+      # reachable from the sandbox that staged this, and homelab-wiki only
+      # records THAT the export permits 192.168.1.0/24, not what mount
+      # options are in use. This is exactly the class of thing the task's own
+      # CI dry-run exists to catch; do not trust it untested.
+      # ansible.posix is a separate collection from ansible.builtin -- confirm
+      # it (or an equivalent) is available on the control node, since nothing
+      # in this repo's README currently documents a collections requirement.
+
+    - name: check for existing restic password file
+      ansible.builtin.stat:
+        path: /root/.restic-password
+      register: restic_pass_file
+
+    - name: prompt for restic repository password if needed
+      ansible.builtin.pause:
+        prompt: >-
+          Enter the EXISTING restic repository password for
+          /mnt/backups/cncpc-restic. The repo already holds snapshots from the
+          machine being rebuilt -- this MUST be the same password used to
+          create it, not a freshly chosen one, or every restic command below
+          will fail with "wrong password". Retrieve it from wherever it is
+          held out of band; it is not, and must not be, recorded in this repo.
+        echo: no
+      register: restic_password_input
+      when: not restic_pass_file.stat.exists
+
+    - name: write restic password file
+      ansible.builtin.copy:
+        content: "{{ restic_password_input.user_input }}\n"
+        dest: /root/.restic-password
+        owner: root
+        group: root
+        mode: '0600'
+      when: not restic_pass_file.stat.exists
+      no_log: true
+
+    - name: install restic-verify-configs wrapper
+      ansible.builtin.copy:
+        src: files/restic-verify-configs
+        dest: /usr/local/bin/restic-verify-configs
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: install sudoers grant for restic-verify-configs
+      ansible.builtin.copy:
+        src: files/sudoers.d/90-restic-verify-configs
+        dest: /etc/sudoers.d/90-restic-verify-configs
+        owner: root
+        group: root
+        mode: '0440'
+        validate: 'visudo -cf %s'
+      # Filename UNCONFIRMED against the live host -- see the file's own
+      # header. Confirm with `sudo ls /etc/sudoers.d/` on cncpc first.
+
+    - name: install cncpc restic backup/prune script
+      ansible.builtin.copy:
+        src: files/cncpc-restic-backup.sh
+        dest: /usr/local/bin/cncpc-restic-backup.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: schedule nightly restic backup (root cron, 01:00)
+      ansible.builtin.cron:
+        name: "restic backup: /home/evand + /etc -> cncpc-restic"
+        user: root
+        minute: "0"
+        hour: "1"
+        job: "/usr/local/bin/cncpc-restic-backup.sh backup"
+
+    - name: schedule weekly restic prune (root cron, Sunday 04:00)
+      ansible.builtin.cron:
+        name: "restic prune: cncpc-restic"
+        user: root
+        minute: "0"
+        hour: "4"
+        weekday: "0"
+        job: "/usr/local/bin/cncpc-restic-backup.sh prune"
+
   handlers:
     - name: restart lightdm
       ansible.builtin.systemd:

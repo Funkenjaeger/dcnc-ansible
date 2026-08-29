@@ -1,0 +1,104 @@
+#!/bin/bash
+# /usr/local/bin/cncpc-restic-backup.sh (cncpc, installed by this playbook)
+#
+# Runs cncpc's actual restic data backup: /home/evand and /etc into the NFS
+# repo at /mnt/backups/cncpc-restic. THIS SCRIPT DID NOT EXIST IN ANY REPO
+# BEFORE THIS PATCH (2026-08-22) -- it is originated here, not copied, unlike
+# restic-verify-configs (which IS copied verbatim from homelab-ops.git). The
+# commands below are transcribed from homelab-wiki docs/hosts/cncpc.md's
+# "restic" section, which documents what already runs on the live machine
+# from root's crontab; this packages that into a reviewable, version
+# controlled script instead of two bare command lines the wiki describes but
+# nothing enforces.
+#
+# CONVENTIONS DELIBERATELY BORROWED from homelab-ops.git's
+# dserver/restic-backup.sh (set -uo pipefail, ts()/log() helpers, a
+# mountpoint guard before touching anything, RESTIC_REPOSITORY /
+# RESTIC_PASSWORD_FILE exported once) -- see that script for the sibling
+# implementation on dserver. NOT copied verbatim, because the two hosts'
+# jobs differ in real ways: dserver's script does backup + forget/prune +
+# a weekly read-data-subset integrity check in ONE invocation with an
+# internal day-of-week gate; cncpc's design per the wiki is TWO separate
+# cron entries (01:00 backup, Sunday 04:00 prune) with no integrity-check
+# step documented at all -- so this script exposes "backup" and "prune" as
+# separate subcommands rather than inventing a combined shape the wiki does
+# not describe. If cncpc should also get a weekly --read-data-subset check,
+# that is a design decision for whoever confirms this against the live
+# crontab, not something to silently add here.
+#
+# THIS SCRIPT DOES NOT WRITE cncpc-status.json. That is
+# ~/bin/report-backup-status.sh's job (homelab-wiki docs/backups.md:652,
+# TickTick 6a8706a5) -- a SEPARATE undeclared script this task does not own.
+# Writing status output here would duplicate or conflict with whatever that
+# script ends up doing. This script only logs to $LOG.
+#
+# NOT YET TESTED against a real repo or a real trixie host -- there is no
+# LAN path to cncpc from this sandbox, and no local restic binary to run
+# against a scratch repo either (checked: `which restic` -> not found here).
+# This is staged, reviewed-by-reading code, not proven-by-running code. The
+# task's own CI-dry-run mandate exists exactly to close that gap before a
+# real rebuild depends on it.
+
+set -uo pipefail
+
+REPO=/mnt/backups/cncpc-restic
+PWFILE=/root/.restic-password
+LOG=/var/log/cncpc-restic-backup.log
+
+export RESTIC_REPOSITORY="$REPO"
+export RESTIC_PASSWORD_FILE="$PWFILE"
+
+ts() { date -Is; }
+log() { echo "$(ts) $*" >> "$LOG"; }
+
+usage() {
+    echo "usage: ${0##*/} backup|prune" >&2
+    exit 2
+}
+
+[ "$#" -eq 1 ] || usage
+
+if ! mountpoint -q /mnt/backups; then
+    # Cannot even write meaningfully -- the whole repo lives under this
+    # mount, and it is a SIBLING of the rsync target /mnt/backups/cncpc, not
+    # a child (see homelab-wiki docs/hosts/cncpc.md, "Repo placement
+    # matters" -- rsync_backup.sh runs --delete against /mnt/backups/cncpc/
+    # and a repo inside that path would be deleted nightly as "not present
+    # in source"). Say nothing rather than run restic against a path that
+    # does not exist and produce a confusing error.
+    log "ABORT: /mnt/backups not mounted"
+    exit 1
+fi
+
+case "$1" in
+    backup)
+        log "=== backup start ==="
+        # Paths and --exclude-caches per homelab-wiki docs/hosts/cncpc.md's
+        # "restic" section, transcribed, not invented. Root is required for
+        # full /etc coverage (netplan, shadow, sudoers, SSH host keys) --
+        # see that section's "Run it as root, or /etc coverage is a lie".
+        if restic backup /home/evand /etc --exclude-caches \
+              --tag nightly >> "$LOG" 2>&1; then
+            log "backup OK"
+        else
+            log "FAIL restic backup exited non-zero"
+            exit 1
+        fi
+        ;;
+    prune)
+        log "=== prune start ==="
+        # Retention per homelab-wiki docs/hosts/cncpc.md, transcribed
+        # verbatim: --keep-daily 7 --keep-weekly 4 --keep-monthly 6.
+        if restic forget --tag nightly \
+              --keep-daily 7 --keep-weekly 4 --keep-monthly 6 --prune \
+              >> "$LOG" 2>&1; then
+            log "prune OK"
+        else
+            log "FAIL restic forget/prune exited non-zero"
+            exit 1
+        fi
+        ;;
+    *)
+        usage
+        ;;
+esac
