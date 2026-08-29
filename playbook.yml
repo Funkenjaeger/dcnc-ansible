@@ -35,15 +35,50 @@
         vnc_password: "{{ vnc_password_input.user_input }}"
       when: not x11vnc_pass_file.stat.exists
 
-    - name: linux-image-6.1.0-30-rt-amd64
-      ansible.builtin.dpkg_selections:
-        name: linux-image-6.1.0-30-rt-amd64
-        selection: hold
+    # DISCOVER-then-hold, replacing a literal bookworm package name
+    # (linux-image-6.1.0-30-rt-amd64) on 2026-08-29. That literal does not exist
+    # on trixie and dpkg_selections FAILS rather than skipping, so a rebuild
+    # stopped dead here at task 7 of 34 -- proven in a disposable trixie VM, not
+    # reasoned about. Naming trixie's current RT kernel as a literal instead
+    # would only defer the same failure: trixie ships point releases and
+    # superseded RT binaries leave the archive.
+    - name: discover the installed RT kernel image
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Package}\\n' 'linux-image-[0-9]*-rt-amd64' 2>/dev/null | head -1"
+      register: rt_kernel_pkg
+      changed_when: false
+      failed_when: false
 
-    - name: linux-image-rt-amd64
+    - name: hold the installed RT kernel image
+      ansible.builtin.dpkg_selections:
+        name: "{{ rt_kernel_pkg.stdout | trim }}"
+        selection: hold
+      when: rt_kernel_pkg.stdout | trim | length > 0
+
+    - name: report when no RT kernel is installed yet
+      ansible.builtin.debug:
+        msg: >-
+          No linux-image-*-rt-amd64 package is installed, so nothing was held.
+          On a fresh LinuxCNC ISO the RT kernel arrives with the distribution;
+          if this message appears on a real rebuild, the kernel step above it
+          did not do what it claims.
+      when: rt_kernel_pkg.stdout | trim | length == 0
+
+    # Guarded 2026-08-29. The metapackage was believed "safe named literally";
+    # execution showed dpkg_selections fails hard when the package is not
+    # INSTALLED, which is the same failure as the bookworm literal above.
+    - name: is the RT metapackage installed
+      ansible.builtin.shell:
+        cmd: "dpkg-query -W -f='${Status}' linux-image-rt-amd64 2>/dev/null | grep -q 'install ok installed'"
+      register: rt_meta
+      changed_when: false
+      failed_when: false
+
+    - name: hold the RT metapackage
       ansible.builtin.dpkg_selections:
         name: linux-image-rt-amd64
         selection: hold
+      when: rt_meta.rc == 0
 
     - name: disable brltty service
       ansible.builtin.systemd:
