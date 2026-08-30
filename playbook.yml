@@ -140,6 +140,67 @@
       register: mesa_interface_result
       changed_when: true
 
+
+    # --- Mesa link survivability, added 2026-08-30 -------------------------
+    # Three changes that together let the Mesa link survive the Mesa being
+    # powered off, and let a PC booted before the Mesa still bring the link up
+    # when the Mesa arrives. Before them, either case left eno1 with NO NETDEV
+    # AT ALL -- e1000e probe failed with -3 -- and the only recovery was a
+    # reboot with the Mesa already on.
+    #
+    # Verified at the machine both ways on 2026-08-30. Attribution between them
+    # is NOT established: four things changed at once, including a BIOS setting
+    # ansible cannot reach (Integrated NIC "Enabled with PXE" -> "Enabled").
+    # EEE-off provably cannot explain the boot-time half, since its dispatcher
+    # only fires on 'up'. If this regresses, check wake-on-lan first.
+
+    - name: install ethtool for Mesa link power management
+      ansible.builtin.apt:
+        name: ethtool
+        state: present
+
+    - name: keep the Mesa link configured when the Mesa is powered off
+      ansible.builtin.copy:
+        src: NetworkManager/conf.d/10-mesa-ignore-carrier.conf
+        dest: /etc/NetworkManager/conf.d/10-mesa-ignore-carrier.conf
+        owner: root
+        group: root
+        mode: "0644"
+      notify: reload networkmanager
+
+    - name: disable EEE on the Mesa link on every up event
+      ansible.builtin.copy:
+        src: NetworkManager/dispatcher.d/50-mesa-eee-off
+        dest: /etc/NetworkManager/dispatcher.d/50-mesa-eee-off
+        owner: root
+        group: root
+        mode: "0755"
+
+    # Read before writing so this is idempotent and reports honestly. A bare
+    # `nmcli connection modify` always exits 0 and would report changed every run.
+    - name: read the mesa connection's current wake-on-lan setting
+      ansible.builtin.command:
+        cmd: nmcli -g 802-3-ethernet.wake-on-lan connection show mesa
+      register: mesa_wol
+      changed_when: false
+      failed_when: false
+
+    - name: keep the Mesa PHY powered by enabling wake-on-lan
+      ansible.builtin.command:
+        cmd: nmcli connection modify mesa 802-3-ethernet.wake-on-lan magic
+      when:
+        - mesa_wol.rc == 0
+        - (mesa_wol.stdout | trim) != "magic"
+      notify: reload networkmanager
+
+    - name: report when the mesa connection does not exist yet
+      ansible.builtin.debug:
+        msg: >-
+          The 'mesa' NetworkManager connection does not exist, so wake-on-lan was
+          not set on it. That is expected on a first run before the Mesa
+          interface is configured above, and a problem on any later run.
+      when: mesa_wol.rc != 0
+
     - name: install required packages
       ansible.builtin.apt:
         name:
@@ -470,6 +531,11 @@
         job: "/usr/local/bin/cncpc-restic-backup.sh prune"
 
   handlers:
+
+    - name: reload networkmanager
+      ansible.builtin.systemd:
+        name: NetworkManager
+        state: reloaded
     - name: restart lightdm
       ansible.builtin.systemd:
         name: lightdm

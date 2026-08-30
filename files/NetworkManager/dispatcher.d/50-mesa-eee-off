@@ -1,0 +1,25 @@
+#!/bin/sh
+# Disable Energy Efficient Ethernet on the Mesa link whenever it comes up.
+#
+# WHY: 802.3az LPI drops the PHY into a low-power state that this 82579LM does
+# not reliably renegotiate out of. Before 2026-08-30, losing the Mesa left the
+# NIC unrecoverable without a reboot -- e1000e would not even re-probe it
+# ("probe with driver e1000e failed with error -3", and no netdev at all).
+#
+# ethtool settings are RUNTIME ONLY and do not survive a reboot, which is why
+# this is a dispatcher script rather than a one-shot task. It re-applies on
+# every up event.
+#
+# Note this fires on 'up', so it does NOT apply during boot-time probe. It is a
+# fix for the runtime drop, not for the boot-with-Mesa-off case -- that one is
+# addressed by wake-on-lan keeping the PHY powered.
+IFACE="$1"
+ACTION="$2"
+
+[ "$IFACE" = "eno1" ] || exit 0
+
+case "$ACTION" in
+  up) /usr/sbin/ethtool --set-eee "$IFACE" eee off >/dev/null 2>&1 ;;
+esac
+
+exit 0
