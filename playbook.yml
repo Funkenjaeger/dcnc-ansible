@@ -205,8 +205,6 @@
       ansible.builtin.apt:
         name:
           - git
-          - timeshift
-          - backintime-qt
           - cinnamon
           - x11vnc
         state: present
@@ -268,41 +266,14 @@
         state: started
         daemon_reload: yes
 
-    - name: configure timeshift backup device
-      ansible.builtin.command:
-        cmd: timeshift --snapshot-device /dev/sda5 --rsync
-      changed_when: false
-
-    - name: create timeshift configuration file
-      ansible.builtin.copy:
-        src: files/timeshift.json
-        dest: /etc/timeshift/timeshift.json
-        owner: root
-        group: root
-        mode: '0644'
-        backup: yes
-
-    - name: ensure timeshift cron job is active
-      ansible.builtin.command:
-        cmd: timeshift --check
-      changed_when: false
-
-    - name: find latest backintime snapshot
-      ansible.builtin.shell:
-        cmd: 'find /backup/backintime/backintime/cncpc/evand/1/ -maxdepth 1 -type d -name "*-*" | sort | tail -1'
-      register: latest_snapshot
-      changed_when: false
-
-    - name: restore backintime config from latest backup
-      ansible.builtin.copy:
-        src: "{{ latest_snapshot.stdout }}/backup/home/evand/.config/backintime/config"
-        dest: "/home/evand/.config/backintime/config"
-        owner: evand
-        group: evand
-        mode: '0644'
-        backup: yes
-      when: latest_snapshot.stdout != ""
-      become: no
+    # Timeshift (3 tasks) and BackInTime (2 tasks) were REMOVED 2026-08-30,
+    # along with files/timeshift.json and the two packages above. They are
+    # superseded by the restic role below, which is the proven mechanism
+    # (restore verified 2026-08-01, snapshot 31cfa91e, byte-for-byte) and which
+    # backs up to an NFS repo rather than to a partition on the very disk a
+    # rebuild replaces. This also retires the hard-coded /dev/sda5 -- it was
+    # only ever Timeshift's snapshot device, so it died with it rather than
+    # needing its own fix.
 
     - name: copy udev rules for imach-p4s
       ansible.builtin.copy:
@@ -424,9 +395,8 @@
     # NOT covered here, deliberately:
     #   - cncpc/report-backup-status.sh and the cncpc-status.json it feeds --
     #     TickTick 6a8706a5's job, still a placeholder as of 2026-08-22.
-    #   - The Timeshift/BackInTime DROP (5 tasks) + SPLIT (1 task) this task's
-    #     own body scopes at playbook.yml:112-113,175-209 -- left untouched
-    #     tonight so this patch is purely additive.
+    #   - (The Timeshift/BackInTime DROP + SPLIT that this note deferred was
+    #     DONE on 2026-08-30; see the comment where those tasks used to be.)
     #   - A weekly restic integrity check (--read-data-subset, as dserver's
     #     restic-backup.sh runs) -- not documented anywhere for cncpc, so not
     #     invented here; see files/cncpc-restic-backup.sh's own header.

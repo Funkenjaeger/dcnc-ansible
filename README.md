@@ -4,11 +4,11 @@
 Note: apart from this section, this entire readme is AI-generated.  This playbook is meant to provision a fresh installation of LinuxCNC 2.9.4 from the official ISO (Debian 12) to match my own personal preferences.  Yours will undoubtedly differ.  The intent is that immediately after completing the OS installation, the steps in the [Quick Start](#quick-start) section should fully configure the system.
 
 Warnings:
-- This assumes there's a dedicated partition for backups with mount point /backup at /dev/sda5 that should be persisted through system reinstallations.
 - DO NOT do an ```apt upgrade``` prior to running this playbook.  It will break, and one of the things this playbook does is mitigate that.
 
-To Do:
-- Currently the UUID of the backup partition is hard-coded in the playbook.  make it not.
+Note: backups are restic to an NFS repo, not Timeshift/BackInTime to a local
+partition.  The /backup partition on /dev/sda5, and the hard-coded UUID that
+went with it, were removed on 2026-08-30 along with the tasks that used them.
 
 ## Summary
 Comprehensive Ansible automation for setting up a complete LinuxCNC workstation with desktop environment, backup systems, remote access, virtual environment setup, and development tools.
@@ -17,7 +17,7 @@ Comprehensive Ansible automation for setting up a complete LinuxCNC workstation 
 
 This playbook transforms a fresh Debian system into a fully configured LinuxCNC workstation with:
 - Smart VNC remote access with conditional password handling
-- Automated backup systems (Timeshift + Back in Time)
+- restic backups of /home/evand and /etc to an NFS repository
 - Desktop environment configuration (Cinnamon)
 - Python virtual environment for LinuxCNC tools
 - Adafruit IO integration for IoT connectivity
@@ -27,7 +27,7 @@ This playbook transforms a fresh Debian system into a fully configured LinuxCNC 
 ## Features
 
 - **🔐 Smart VNC Setup**: Conditional password prompting - only asks when needed
-- **🔄 Dual Backup Systems**: System snapshots (Timeshift) + user data backups (Back in Time)
+- **🔄 Disaster-Recovery Backups**: restic to an NFS repo, with a verified restore path
 - **🖥️ Desktop Ready**: Cinnamon desktop with optimized settings for CNC work
 - **🐍 Python Environment**: Isolated virtual environment for LinuxCNC Python dependencies
 - **🌐 IoT Integration**: Adafruit IO setup with secure credential management
@@ -35,7 +35,6 @@ This playbook transforms a fresh Debian system into a fully configured LinuxCNC 
 - **🔌 Hardware Integration**: udev rules for custom hardware (imach-p4s)
 - **🛡️ System Hardening**: Kernel hold, service management, security configurations
 - **🌐 Remote Access**: x11vnc with Avahi discovery for easy connection
-- **📂 Config Restoration**: Automatically restores backup configurations from existing snapshots
 - **🛠️ Initramfs Management**: Disables automatic updates to prevent system instability
 - **⬆️ Package Management**: Automated apt updates and upgrades with proper sequencing
 
@@ -102,7 +101,7 @@ The playbook will prompt you for:
 15. **configure selected interface with Mesa IP** - Set up Mesa network connection (if needed)
 
 ### 📦 Package Installation
-16. **install required packages** - Install: git, timeshift, backintime-qt, cinnamon, x11vnc
+16. **install required packages** - Install: git, cinnamon, x11vnc
 
 ### 🖥️ Desktop Environment Setup
 17. **set cinnamon as default session manager** - Configure lightdm for Cinnamon
@@ -116,13 +115,12 @@ The playbook will prompt you for:
 23. **enable and start x11vnc service** - Activate remote desktop access
 
 ### 🔄 Backup Systems Configuration
-24. **configure timeshift backup device** - Set RSYNC mode with `/dev/sda5`
-25. **create timeshift configuration file** - Full config: 6 monthly, 3 weekly, 3 daily snapshots
-26. **ensure timeshift cron job is active** - Activate scheduled system snapshots
+Timeshift and Back in Time were removed on 2026-08-30; restic replaced them.
+See the restic block near the end of `playbook.yml`.
 
-### 📂 Back in Time Restoration
-27. **find latest backintime snapshot** - Locate most recent backup in `/backup/backintime/`
-28. **restore backintime config from latest backup** - Restore user backup configuration
+NOTE: the numbering in this walk-through is stale and has been since before
+that change -- it claims 40 tasks against a real count that has never matched.
+Read it as an outline of order, not as an index.
 
 ### 🔌 Hardware Integration
 29. **copy udev rules for imach-p4s** - Install custom udev rules for hardware integration
@@ -163,9 +161,10 @@ The playbook will prompt you for:
 - **Automatic Reload**: udev rules are automatically reloaded when updated
 
 ### Backup Configuration
-- **Timeshift**: RSYNC mode, `/dev/sda5` storage, excludes `/home/evand/**`
-- **Back in Time**: Automatically restores configuration from latest available snapshot
-- **Retention**: 6 monthly, 3 weekly, 3 daily snapshots
+- **restic**: `/home/evand` and `/etc` to `/mnt/backups/cncpc-restic`, an NFS
+  mount of 192.168.1.143:/volume1/backups
+- **Schedule**: root cron, nightly backup at 01:00, prune Sundays at 04:00
+- **Retention**: `--keep-daily 7 --keep-weekly 4 --keep-monthly 6`
 
 ### VNC Access
 - **Port**: 5900 (default VNC port)
@@ -193,7 +192,6 @@ dcnc-ansible/
 ├── inventory.ini            # Inventory configuration
 ├── files/                   # Source files for copying
 │   ├── 99-imach-p4s.rules  # udev rules for imach-p4s hardware
-│   ├── timeshift.json      # Timeshift configuration
 │   └── x11vnc.service      # x11vnc systemd service definition
 └── .gitignore              # Git ignore rules
 ```
@@ -213,14 +211,14 @@ dcnc-ansible/
 ✅ **Python Environment Management** - Isolated virtual environment for dependencies  
 ✅ **IoT Integration** - Secure Adafruit IO credential management  
 ✅ **Hardware Integration** - Custom udev rules for specialized hardware  
-✅ **Backup Integration** - Both system (Timeshift) and user data (Back in Time)  
+✅ **Backup Integration** - restic to an NFS repo, restore proven 2026-08-01  
 ✅ **Security-First Design** - Encrypted passwords, secure prompting, hidden API keys  
 ✅ **System Hardening** - Kernel holds, initramfs management, safe upgrades  
 ✅ **Production Ready** - Handles services, dependencies, and error conditions
 
 ## Hardware Requirements
 
-- **Storage**: Dedicated backup partition (`/dev/sda5`) for Timeshift
+- **Storage**: Network reachability to the NFS backup host (192.168.1.143)
 - **Memory**: Minimum 4GB RAM recommended for desktop environment
 - **Network**: Ethernet connection recommended for reliability
 - **USB**: Support for imach-p4s hardware (if using custom udev rules)
@@ -229,7 +227,7 @@ dcnc-ansible/
 
 ### Common Issues
 - **VNC Connection**: Ensure port 5900 is open in firewall
-- **Backup Failures**: Verify `/dev/sda5` is mounted and writable
+- **Backup Failures**: Verify `/mnt/backups` is mounted and `/root/.restic-password` exists
 - **Service Issues**: Check systemd service status with `systemctl status x11vnc`
 - **Boot Issues**: If initramfs updates cause problems, they're now disabled by default
 - **Python Environment**: Virtual environment issues can be resolved by deleting `/usr/local/venv/linuxcnc_venv` and re-running
@@ -263,6 +261,5 @@ This project is open source. Feel free to use, modify, and distribute according 
 
 - [LinuxCNC](https://linuxcnc.org/) - Open source CNC control software
 - [fj-lcnc-cfg](https://github.com/Funkenjaeger/fj-lcnc-cfg) - LinuxCNC configuration files
-- [Timeshift](https://github.com/teejee2008/timeshift) - System backup utility
-- [Back in Time](https://backintime.readthedocs.io/) - User data backup tool
+- [restic](https://restic.net/) - Backup program with deduplication and verified restores
 - [Adafruit IO](https://io.adafruit.com/) - IoT platform for data logging and control
