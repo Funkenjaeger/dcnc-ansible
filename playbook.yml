@@ -435,6 +435,29 @@
         path: /root/.restic-password
       register: restic_pass_file
 
+    # GUARD B -- un-stick a machine that already carries a bad password file.
+    # A password file that EXISTS but is empty is worse than no file at all:
+    # restic refuses it ("an empty password is not allowed by default") while
+    # a bare stat.exists test sees it, skips the prompt below, and leaves the
+    # machine permanently unable to authenticate to its own repo -- every
+    # later run reports ok/skipped and changes nothing. Measured on the
+    # dry-run VM: a non-interactive run writes a file of size 1, holding just
+    # the newline the write task appends, so a stat.size > 0 test does NOT
+    # catch it. The content has to be read and trimmed.
+    - name: read the existing restic password file
+      ansible.builtin.slurp:
+        src: /root/.restic-password
+      register: restic_pass_file_content
+      when: restic_pass_file.stat.exists
+      no_log: true
+
+    - name: decide whether a usable restic password file is already in place
+      ansible.builtin.set_fact:
+        restic_pass_file_usable: >-
+          {{ restic_pass_file.stat.exists
+             and (restic_pass_file_content.content | default('')
+                  | b64decode | trim | length) > 0 }}
+
     - name: prompt for restic repository password if needed
       ansible.builtin.pause:
         prompt: >-
@@ -446,7 +469,27 @@
           held out of band; it is not, and must not be, recorded in this repo.
         echo: no
       register: restic_password_input
-      when: not restic_pass_file.stat.exists
+      when: not restic_pass_file_usable
+
+    # GUARD A -- refuse the bad write. ansible.builtin.pause does NOT fail when
+    # stdin is not a tty: it warns "Not waiting for response to prompt as stdin
+    # is not interactive", returns ok, and leaves user_input empty, so without
+    # this check the write task below lands that empty value. failed_when on
+    # the pause stops the run too, but on ansible-core 2.19 it reports only
+    # "Task failed: Action failed: Unknown error.", which tells the operator
+    # nothing -- so this mirrors "verify VNC passwords match" above instead.
+    - name: verify a restic repository password was actually captured
+      ansible.builtin.fail:
+        msg: >-
+          No restic repository password was captured. ansible.builtin.pause
+          cannot prompt when stdin is not interactive, so this playbook must be
+          run from a terminal. Refusing to write an empty
+          /root/.restic-password -- restic rejects an empty password, and the
+          file would then make every later run skip this block, leaving the
+          machine looking configured while its backups can never authenticate.
+      when:
+        - not restic_pass_file_usable
+        - (restic_password_input.user_input | default('') | trim | length) == 0
 
     - name: write restic password file
       ansible.builtin.copy:
@@ -455,7 +498,7 @@
         owner: root
         group: root
         mode: '0600'
-      when: not restic_pass_file.stat.exists
+      when: not restic_pass_file_usable
       no_log: true
 
     - name: install restic-verify-configs wrapper
