@@ -410,9 +410,17 @@
       register: adafruit_username_input
       when: not adafruit_username_usable
 
+    # pause echoes typed input BY DEFAULT, so the key was displayed on the lathe
+    # PC's screen as it was typed. There was no `echo: yes` here to notice and
+    # remove -- the ABSENCE of the option was the defect, which is why it
+    # survived review. Every other secret prompt in this file (both VNC
+    # passwords, the restic password) already hides input; this one was missed.
+    # The USERNAME prompt above deliberately still echoes: it is
+    # `funkenjaeger`, it is public, and hiding it would be theatre.
     - name: prompt for Adafruit IO key
       ansible.builtin.pause:
-        prompt: "Enter your Adafruit IO key"
+        prompt: "Enter your Adafruit IO key (input hidden)"
+        echo: no
       register: adafruit_key_input
       when: not adafruit_key_usable
 
@@ -467,6 +475,11 @@
         owner: "{{ dcnc_user }}"
         mode: '0644'
         backup: yes
+      # At -v the whole module argument is printed, and `line:` carries the key
+      # in clear -- and -v is precisely what gets reached for when a
+      # provisioning run misbehaves. Matches the restic password write below.
+      # Cost, stated plainly: this task's changed/ok detail is suppressed too.
+      no_log: true
       when: not adafruit_key_usable
       become: no
 
