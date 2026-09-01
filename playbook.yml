@@ -2,6 +2,15 @@
   hosts: local
   become: yes
 
+  vars:
+    # The human account this workstation is configured FOR: the account whose
+    # desktop session LinuxCNC runs in, and whose ~/.profile its HAL components
+    # inherit their environment from. NAMED on purpose, added 2026-09-01. It
+    # used to be inferred from ansible_env.USER, which follows the BECOME
+    # identity rather than the invoker and therefore rendered "root" under this
+    # play's play-level become: yes. Override with -e dcnc_user=<name>.
+    dcnc_user: evand
+
   tasks:
 
     - name: check if x11vnc password file exists
@@ -305,53 +314,161 @@
         mode: '0755'
       when: not venv_exists.stat.exists
 
-    - name: check if ADAFRUIT_IO_USERNAME is set
-      ansible.builtin.shell:
-        cmd: echo "${ADAFRUIT_IO_USERNAME:-}"
-      register: existing_username
-      changed_when: false
-      become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+    # ==========================================================================
+    # ADAFRUIT IO CREDENTIALS -- rewritten 2026-09-01. Three defects, each
+    # measured on the dcnc-dryrun VM or read on the real cncpc, not reasoned
+    # about.
+    #
+    # 1. THE PATH. These tasks wrote to
+    #      /home/{{ ansible_env.USER | default(ansible_user_id) }}/.bashrc
+    #    but ansible_env follows the BECOME identity, not the invoker. This
+    #    play has become: yes at play level, so ansible_env.USER renders
+    #    "root" and every rebuild died here with
+    #      "Destination /home/root/.bashrc does not exist !"
+    #    ansible_env.SUDO_USER is <UNDEFINED> under become, so that is not a
+    #    fix either. The target account is now NAMED, in dcnc_user above.
+    #
+    # 2. THE FILE. .bashrc is sourced only by INTERACTIVE bash shells. The
+    #    consumer of these variables is
+    #      ~/linuxcnc/configs/DCNC/hal_components/bin/aircompressor
+    #    a Python HAL component reading os.environ, launched by LinuxCNC from
+    #    the GUI session (lightdm -> user@<uid>.service) and never from an
+    #    interactive shell -- so it never saw a .bashrc export. It also fails
+    #    SOFT: it prints "Adafruit.io credentials not set in environment
+    #    variables, unable to connect" and carries on. On the real cncpc the
+    #    credentials sit in BOTH ~/.bashrc and ~/.profile, and it is the
+    #    .profile copy doing the work. Fixing only the path would have built a
+    #    machine that provisions cleanly, reports success, and whose air
+    #    compressor control silently never connects. Write .profile.
+    #
+    # 3. THE EXISTENCE TEST. It was `echo "${ADAFRUIT_IO_USERNAME:-}"` through
+    #    the shell module -- a non-interactive, non-login shell that sources
+    #    neither .profile nor .bashrc, so it reported "unset" even on a
+    #    correctly configured machine and the block could never skip. The test
+    #    now reads the file that is actually written. It trims, so an empty
+    #    export ADAFRUIT_IO_USERNAME="" counts as ABSENT and a machine
+    #    carrying one re-prompts instead of skipping forever (cf. the restic
+    #    password file below, which was 1 byte and not 0).
+    # ==========================================================================
+    - name: check that the dcnc user home directory exists
+      ansible.builtin.stat:
+        path: "/home/{{ dcnc_user }}"
+      register: dcnc_home
 
-    - name: check if ADAFRUIT_IO_KEY is set
-      ansible.builtin.shell:
-        cmd: echo "${ADAFRUIT_IO_KEY:-}"
-      register: existing_key
-      changed_when: false
-      become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
+    # Deliberately FAIL rather than create the account. This playbook
+    # configures an existing LinuxCNC workstation; the operator account has to
+    # be the one whose graphical session LinuxCNC is launched from, and its
+    # uid, groups and skeleton are not knowable from here. Creating a
+    # plausible-looking account would write credentials into a home directory
+    # no HAL component ever reads -- the same class of silent success this
+    # whole block exists to stop.
+    - name: fail when the dcnc user home directory is missing
+      ansible.builtin.fail:
+        msg: >-
+          /home/{{ dcnc_user }} does not exist, so there is nowhere to put the
+          Adafruit IO credentials that the aircompressor HAL component reads
+          from its session environment. This playbook does not create the
+          operator account: it must match the account whose desktop session
+          LinuxCNC runs in. Create it first, or name the right one with
+          -e dcnc_user=<name>.
+      when: not dcnc_home.stat.exists
+
+    - name: check for an existing dcnc user profile
+      ansible.builtin.stat:
+        path: "/home/{{ dcnc_user }}/.profile"
+      register: dcnc_profile_file
+
+    - name: read the existing dcnc user profile
+      ansible.builtin.slurp:
+        src: "/home/{{ dcnc_user }}/.profile"
+      register: dcnc_profile_content
+      when: dcnc_profile_file.stat.exists
+      no_log: true
+
+    - name: decide whether usable Adafruit IO credentials are already in place
+      ansible.builtin.set_fact:
+        adafruit_username_usable: >-
+          {{ (dcnc_profile_content.content | default('') | b64decode).splitlines()
+             | map('trim')
+             | select('match', 'export ADAFRUIT_IO_USERNAME=')
+             | map('regex_replace', '^export ADAFRUIT_IO_USERNAME=', '')
+             | map('trim', '" ')
+             | reject('eq', '')
+             | list | length > 0 }}
+        adafruit_key_usable: >-
+          {{ (dcnc_profile_content.content | default('') | b64decode).splitlines()
+             | map('trim')
+             | select('match', 'export ADAFRUIT_IO_KEY=')
+             | map('regex_replace', '^export ADAFRUIT_IO_KEY=', '')
+             | map('trim', '" ')
+             | reject('eq', '')
+             | list | length > 0 }}
 
     - name: prompt for Adafruit IO username
       ansible.builtin.pause:
         prompt: "Enter your Adafruit IO username"
       register: adafruit_username_input
-      when: existing_username.stdout == ""
+      when: not adafruit_username_usable
 
     - name: prompt for Adafruit IO key
       ansible.builtin.pause:
         prompt: "Enter your Adafruit IO key"
       register: adafruit_key_input
-      when: existing_key.stdout == ""
+      when: not adafruit_key_usable
 
+    # GUARD -- refuse an empty capture, before anything is written.
+    # ansible.builtin.pause does NOT fail when stdin is not a tty: it warns
+    # "Not waiting for response to prompt as stdin is not interactive",
+    # returns ok, and leaves user_input empty. Without this, an unattended run
+    # writes export ADAFRUIT_IO_USERNAME="" -- and because the HAL component
+    # fails soft, the only symptom is an air compressor that never connects.
+    # failed_when on the pause stops the run too, but on ansible-core 2.19 it
+    # reports only "Task failed: Action failed: Unknown error." (measured), so
+    # this uses the fail-with-msg idiom already used by "verify VNC passwords
+    # match" above and by the restic password guard below.
+    - name: verify Adafruit IO credentials were actually captured
+      ansible.builtin.fail:
+        msg: >-
+          No Adafruit IO credentials were captured. ansible.builtin.pause
+          cannot prompt when stdin is not interactive, so this playbook must be
+          run from a terminal. Refusing to write an empty value to
+          /home/{{ dcnc_user }}/.profile: the aircompressor HAL component fails
+          soft on empty credentials, so the machine would report a clean
+          install while its air compressor control silently never connects.
+      when: >-
+        (not adafruit_username_usable and
+         (adafruit_username_input.user_input | default('') | trim | length) == 0)
+        or (not adafruit_key_usable and
+            (adafruit_key_input.user_input | default('') | trim | length) == 0)
+
+    # become: no (inherited intent from the original tasks) so the write runs
+    # as the invoker, avoiding the become-to-unprivileged-user temp-file
+    # problem. owner: makes the result correct anyway when the invoker is root.
+    # The old become_user: here referenced ansible_env.USER and was inert under
+    # become: no; it is gone rather than repaired.
     - name: set ADAFRUIT_IO_USERNAME environment variable
       ansible.builtin.lineinfile:
-        path: /home/{{ ansible_env.USER | default(ansible_user_id) }}/.bashrc
+        path: "/home/{{ dcnc_user }}/.profile"
         regexp: '^export ADAFRUIT_IO_USERNAME='
         line: 'export ADAFRUIT_IO_USERNAME="{{ adafruit_username_input.user_input }}"'
+        create: yes
+        owner: "{{ dcnc_user }}"
+        mode: '0644'
         backup: yes
-      when: existing_username.stdout == ""
+      when: not adafruit_username_usable
       become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
 
     - name: set ADAFRUIT_IO_KEY environment variable
       ansible.builtin.lineinfile:
-        path: /home/{{ ansible_env.USER | default(ansible_user_id) }}/.bashrc
+        path: "/home/{{ dcnc_user }}/.profile"
         regexp: '^export ADAFRUIT_IO_KEY='
         line: 'export ADAFRUIT_IO_KEY="{{ adafruit_key_input.user_input }}"'
+        create: yes
+        owner: "{{ dcnc_user }}"
+        mode: '0644'
         backup: yes
-      when: existing_key.stdout == ""
+      when: not adafruit_key_usable
       become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
 
     - name: create python virtual environment
       ansible.builtin.command:
