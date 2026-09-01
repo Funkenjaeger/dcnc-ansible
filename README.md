@@ -67,6 +67,54 @@ The playbook will prompt you for:
 - Ethernet interface for Mesa configuration (if needed)
 - Adafruit IO username and key (only on first run)
 
+### Running unattended (CI, a script, or any run without a terminal)
+
+**`ansible.builtin.pause` is a two-sided trap, and both sides bite.**
+
+| how you run it | what `pause` does |
+|---|---|
+| no tty (stdin not interactive) | **does not block.** Warns `Not waiting for response to prompt as stdin is not interactive`, returns `ok`, and leaves `user_input` **empty** |
+| any tty present (including one driven by `expect`) | **blocks forever.** It will sit there indefinitely and outlive whatever was driving it |
+
+The first side is why the credential tasks have explicit guards: without them an
+unattended run wrote `export ADAFRUIT_IO_USERNAME=""` and a 1-byte restic
+password file, and because the consumers fail *soft*, the only symptom was an
+air compressor that never connected and backups that could not authenticate.
+Worse, the restic case was **sticky** -- the "does the file exist" check saw the
+1-byte file and skipped the fix on every subsequent run.
+
+The second side is not hypothetical either: a stray `ansible-playbook` driving a
+`pause` through a pty sat hung on the dry-run VM for **two days** before anyone
+noticed it.
+
+**So: do not try to drive the prompts. Supply the values instead.** Extra-vars
+are Ansible's highest-precedence source, so they shadow the registered `pause`
+result and need no tty at all:
+
+```bash
+ansible-playbook -i inventory.ini playbook.yml \
+  -e '{"adafruit_username_input":{"user_input":"YOUR_USERNAME"}}' \
+  -e '{"adafruit_key_input":{"user_input":"YOUR_KEY"}}' \
+  -e '{"restic_password_input":{"user_input":"THE_EXISTING_REPO_PASSWORD"}}' \
+  < /dev/null
+```
+
+Pass only the ones you need -- each block is skipped entirely when usable
+credentials are already present on the machine, so a second run needs none of
+them.
+
+**The guards are not bypassed by this.** Verified 2026-09-01 on the dry-run VM:
+an extra-var carrying an **empty** value still fails at
+`verify Adafruit IO credentials were actually captured` and writes nothing.
+Extra-vars are a way around the *prompt*, never around the *check*.
+
+**Do not put a real key in shell history or a CI log.** Read it from a file or
+an environment variable at the point of use.
+
+**Known gap:** `ansible-playbook` exits **0** when the inventory matches no
+hosts -- a run with a mistyped `-i` prints an empty `PLAY RECAP`, does nothing,
+and looks green. Check the recap names a host before believing a clean run.
+
 ## Requirements
 
 - **Target System**: Debian GNU/Linux
@@ -238,6 +286,13 @@ Run with verbose output:
 ```bash
 ansible-playbook -i inventory.ini playbook.yml --ask-become-pass -vvv
 ```
+
+Note that `-vvv` prints each task's full module arguments. Tasks handling
+secrets are marked `no_log`, so the Adafruit IO key and the restic repository
+password appear as `censored` rather than in clear -- that is deliberate, and
+the cost is that those tasks' `changed`/`ok` detail is suppressed too. If you
+need to see whether such a task acted, check the effect on the machine rather
+than reaching for more `-v`.
 
 ### Manual Virtual Environment Activation
 To manually use the Python virtual environment:
