@@ -23,6 +23,7 @@
         prompt: "Enter the VNC password"
         echo: no
       register: vnc_password_input
+      no_log: true
       when: not x11vnc_pass_file.stat.exists
 
     - name: confirm VNC password if needed
@@ -30,6 +31,7 @@
         prompt: "Confirm the VNC password"
         echo: no
       register: vnc_password_confirm
+      no_log: true
       when: not x11vnc_pass_file.stat.exists
 
     - name: verify VNC passwords match
@@ -422,6 +424,7 @@
         prompt: "Enter your Adafruit IO key (input hidden)"
         echo: no
       register: adafruit_key_input
+      no_log: true
       when: not adafruit_key_usable
 
     # GUARD -- refuse an empty capture, before anything is written.
@@ -599,6 +602,7 @@
           held out of band; it is not, and must not be, recorded in this repo.
         echo: no
       register: restic_password_input
+      no_log: true
       when: not restic_pass_file_usable
 
     # GUARD A -- refuse the bad write. ansible.builtin.pause does NOT fail when
