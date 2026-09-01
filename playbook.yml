@@ -405,9 +405,11 @@
     # staged this (`which ansible ansible-playbook` -> not found). This is
     # staged, reviewed-by-reading YAML, not proven-by-running YAML.
 
-    - name: install restic
+    - name: install restic and the NFS client
       ansible.builtin.apt:
-        name: restic
+        name:
+          - restic
+          - nfs-common
         state: present
         update_cache: yes
 
