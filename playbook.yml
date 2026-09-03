@@ -11,6 +11,44 @@
     # play's play-level become: yes. Override with -e dcnc_user=<name>.
     dcnc_user: evand
 
+    # WHERE THE RESTIC BACKUP LIVES. Defaults ARE the production values, so an
+    # un-overridden run behaves exactly as before -- the template renders
+    # byte-identical to the script these replaced, and that is asserted rather
+    # than assumed (see templates/cncpc-restic-backup.sh.j2).
+    #
+    # Added 2026-09-03 so the DRY RUN can prove the playbook without the real
+    # repo password. Assertion 13 of the dry run was previously unreachable:
+    # REPO and the NFS source were hardcoded, so the only way to satisfy it was
+    # to put the real backup credential on a disposable VM and point it at the
+    # production repo -- which tests the SECRET, not the automation. The
+    # playbook cannot be wrong about a value typed into it. Pointed at a
+    # scratch repo, the same assertion tests the restic wiring end to end,
+    # which is what the drill exists to prove.
+    #
+    # Dry-run invocation, all four together:
+    #   -e cncpc_backups_mount_nfs=false \
+    #   -e cncpc_backups_mount=/var/tmp/dryrun-backups \
+    #   -e cncpc_restic_repo=/var/tmp/dryrun-backups/cncpc-restic \
+    #   -e '{"cncpc_backups_guard":"test -d /var/tmp/dryrun-backups"}' \
+    #   -e '{"cncpc_backups_guard_msg":"/var/tmp/dryrun-backups missing"}'
+    #
+    # THE JSON FORM IS LOAD-BEARING for those last two. ansible parses
+    # `-e key=value` with parse_kv, which splits on WHITESPACE -- so
+    # `-e "cncpc_backups_guard=test -d /path"` sets the variable to the
+    # single word `test` and scatters the rest. The script then renders
+    # `if ! test; then`, bare `test` returns false, the guard fires and
+    # the backup aborts. Measured 2026-09-03, on the first run of this
+    # very invocation. Same trap the README documents for the pause
+    # prompts, one layer down.
+    cncpc_backups_mount: /mnt/backups
+    cncpc_backups_nfs_src: "192.168.1.143:/volume1/backups"
+    cncpc_backups_mount_nfs: true
+    cncpc_restic_repo: "{{ cncpc_backups_mount }}/cncpc-restic"
+    # The guard is a COMMAND, not a flag, so a scratch target swaps
+    # `mountpoint -q` for `test -d` without conditional logic in the script.
+    cncpc_backups_guard: "mountpoint -q {{ cncpc_backups_mount }}"
+    cncpc_backups_guard_msg: "{{ cncpc_backups_mount }} not mounted"
+
   tasks:
 
     - name: check if x11vnc password file exists
@@ -486,6 +524,20 @@
       when: not adafruit_key_usable
       become: no
 
+    # `python3 -m venv` fails on a machine that lacks the venv package --
+    # "ensurepip is not available" -- and nothing here installed it. FOUND
+    # 2026-09-03 when a from-scratch dry run aborted at this task, BEFORE
+    # reaching the restic section. Earlier dry runs only got past it because
+    # /usr/local/venv/linuxcnc_venv/bin/activate already existed from a
+    # previous pass, so the guard below skipped the create entirely. A clean
+    # cncpc rebuild -- the thing this playbook exists for -- would have hit it
+    # for real, which is exactly the class of gap the dry run is meant to catch.
+    - name: install the python venv package
+      ansible.builtin.apt:
+        name: python3-venv
+        state: present
+        update_cache: yes
+
     - name: create python virtual environment
       ansible.builtin.command:
         cmd: python3 -m venv /usr/local/venv/linuxcnc_venv
@@ -548,11 +600,12 @@
 
     - name: mount cncpc-restic NFS share
       ansible.posix.mount:
-        path: /mnt/backups
-        src: "192.168.1.143:/volume1/backups"
+        path: "{{ cncpc_backups_mount }}"
+        src: "{{ cncpc_backups_nfs_src }}"
         fstype: nfs4
         opts: defaults
         state: mounted
+      when: cncpc_backups_mount_nfs | bool
       # VERIFY OPTS AGAINST THE LIVE /etc/fstab BEFORE A REAL REBUILD.
       # "defaults" is not a transcription of the live mount line -- no SSH is
       # reachable from the sandbox that staged this, and homelab-wiki only
@@ -562,6 +615,17 @@
       # ansible.posix is a separate collection from ansible.builtin -- confirm
       # it (or an equivalent) is available on the control node, since nothing
       # in this repo's README currently documents a collections requirement.
+
+    # A scratch target is a plain directory, not a mount, so nothing else
+    # creates it. Only runs when the NFS mount is disabled, i.e. a dry run.
+    - name: ensure the backup directory exists (dry-run / non-NFS target)
+      ansible.builtin.file:
+        path: "{{ cncpc_backups_mount }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+      when: not (cncpc_backups_mount_nfs | bool)
 
     - name: check for existing restic password file
       ansible.builtin.stat:
@@ -655,8 +719,8 @@
       # header. Confirm with `sudo ls /etc/sudoers.d/` on cncpc first.
 
     - name: install cncpc restic backup/prune script
-      ansible.builtin.copy:
-        src: files/cncpc-restic-backup.sh
+      ansible.builtin.template:
+        src: templates/cncpc-restic-backup.sh.j2
         dest: /usr/local/bin/cncpc-restic-backup.sh
         owner: root
         group: root

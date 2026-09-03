@@ -41,7 +41,7 @@
 
 set -uo pipefail
 
-REPO=/mnt/backups/cncpc-restic
+REPO={{ cncpc_restic_repo }}
 PWFILE=/root/.restic-password
 LOG=/var/log/cncpc-restic-backup.log
 
@@ -58,7 +58,7 @@ usage() {
 
 [ "$#" -eq 1 ] || usage
 
-if ! mountpoint -q /mnt/backups; then
+if ! {{ cncpc_backups_guard }}; then
     # Cannot even write meaningfully -- the whole repo lives under this
     # mount, and it is a SIBLING of the rsync target /mnt/backups/cncpc, not
     # a child (see homelab-wiki docs/hosts/cncpc.md, "Repo placement
@@ -66,7 +66,7 @@ if ! mountpoint -q /mnt/backups; then
     # and a repo inside that path would be deleted nightly as "not present
     # in source"). Say nothing rather than run restic against a path that
     # does not exist and produce a confusing error.
-    log "ABORT: /mnt/backups not mounted"
+    log "ABORT: {{ cncpc_backups_guard_msg }}"
     exit 1
 fi
 
