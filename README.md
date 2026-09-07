@@ -153,9 +153,14 @@ and looks green. Check the recap names a host before believing a clean run.
 
 ### 🖥️ Desktop Environment Setup
 17. **set cinnamon as default session manager** - Configure lightdm for Cinnamon
-18. **disable screensaver in cinnamon** - Turn off screen lock
-19. **disable screensaver idle activation** - Prevent idle screen activation
-20. **set screen to turn off after 1 hour** - Power management configuration
+18. **do not lock the screen** - No password prompt between operator and machine
+19. **enable the screensaver overlay** - So a waking touch is not a click in AXIS
+20. **show the screensaver overlay after 600s idle** - `org.cinnamon.desktop.session idle-delay`
+21. **power the panel down after 660s idle** - `sleep-display-ac`, staggered behind the overlay
+22. **install the display guard** - `/usr/local/bin/cncpc-display-guard`
+23. **install the display guard user unit** - `/etc/systemd/user/cncpc-display-guard.service`
+24. **enable the display guard for every graphical session** - `systemctl --global enable`
+25. **start the display guard in the current session if there is one** - Best-effort, non-fatal
 
 ### 🌐 Remote Access (VNC)
 21. **create x11vnc password file** - Generate encrypted password file (conditional)
@@ -221,9 +226,62 @@ Read it as an outline of order, not as an index.
 - **Persistence**: Automatic restart on failure
 
 ### Desktop Environment
-- **DE**: Cinnamon with screensaver disabled
-- **Display**: 1-hour screen timeout for CNC work
+- **DE**: Cinnamon, screen lock disabled, screensaver overlay **enabled**
+- **Display**: overlay at 10 min idle, panel powered off at 11 min, both suspended while a program runs
 - **Session**: Configured as default in lightdm
+
+#### Display blanking, and why it is shaped this way
+
+Rewritten 2026-09-07, when the panel became an **Elo 2494L**. What was here
+before amounted to "never blank": lock off, idle activation off, display sleep
+at 3600s. cncpc idles at a static LinuxCNC GUI far more than it cuts, so that
+was an hour of unchanging DRO digits in fixed pixels, indefinitely. The 2494L
+is an LED-backlit industrial LCD, so the exposure is **not** OLED burn-in — it
+is backlight hours (8760 a year if the panel never sleeps, against a rating in
+the tens of thousands) and image sticking.
+
+**The touchscreen is why a shorter timeout alone would have been the wrong
+patch.** DPMS powers the panel down but leaves X fully live, so a touch on a
+dark screen is delivered to whatever sits underneath it. The operator's
+wake-up tap would become a blind click in AXIS, at a coordinate they did not
+choose, on a machine tool. So `idle-activation-enabled` is turned back **on**:
+cinnamon-screensaver takes an input grab and spends that first touch
+dismissing the overlay. `lock-enabled` stays `false` — the overlay exists to
+eat one touch, not to put a password between an operator and a running
+machine. The two timeouts are staggered (`idle-delay` 600s, `sleep-display-ac`
+660s) so the grab is in place before the screen goes dark.
+
+`cncpc-display-guard` then suspends both while LinuxCNC is actually working.
+It holds two independent layers, because two independent things blank this
+screen:
+
+| Layer | What blanks it | How the guard holds it |
+|---|---|---|
+| Session | cinnamon-screensaver + csd-power, on the session idle timer | `org.freedesktop.ScreenSaver` Inhibit cookie — dies with the process's D-Bus connection, so a crash cannot wedge the screen on |
+| X server | the server's own DPMS timers | `xset -dpms`, re-applied every poll so it self-heals if csd-power re-asserts DPMS underneath it |
+
+"Busy" is deliberately wider than "a G-code program is streaming": a paused
+program, a task in `RCS_EXEC`, and a spinning spindle all count, because in all
+of them the operator is at the machine and wants the DRO. Every error path —
+no `linuxcnc` module, a dead NML channel, an unexpected spindle shape — fails
+to **idle**, i.e. "let the screen blank". A broken guard costs a dark screen
+someone wakes with a touch; the opposite default would cook the panel for
+months and report nothing. On exit it restores `+dpms`, so a stopped guard
+cannot leave the display pinned on.
+
+**It never injects synthetic input.** The usual trick for keeping a screen
+awake is nudging a key or the pointer, and on a CNC that is a loaded gun — a
+fake keystroke into AXIS is a jog, an estop toggle, or a spindle command
+depending on focus. The guard changes blanking policy and nothing else.
+
+Tuning: `cncpc_display_idle_secs`, `cncpc_display_blank_secs` and
+`cncpc_display_poll_secs` at the top of the playbook. Keep idle < blank.
+
+Watching it work, from a terminal in the desktop session:
+
+```bash
+journalctl --user -fu cncpc-display-guard.service
+```
 
 ### System Hardening
 - **Kernel Management**: RT kernel packages held to prevent breaking updates
@@ -240,7 +298,11 @@ dcnc-ansible/
 ├── inventory.ini            # Inventory configuration
 ├── files/                   # Source files for copying
 │   ├── 99-imach-p4s.rules  # udev rules for imach-p4s hardware
+│   ├── cncpc-display-guard # holds the display awake while LinuxCNC runs
 │   └── x11vnc.service      # x11vnc systemd service definition
+├── templates/               # Templated files
+│   ├── cncpc-display-guard.service.j2  # user unit for the display guard
+│   └── cncpc-restic-backup.sh.j2       # restic backup/prune script
 └── .gitignore              # Git ignore rules
 ```
 

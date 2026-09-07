@@ -1,0 +1,277 @@
+#!/usr/bin/env python3
+# /usr/local/bin/cncpc-display-guard (cncpc, installed by this playbook)
+#
+# Lets the Elo 2494L blank when the machine is idle, and holds it awake while
+# LinuxCNC is actually running a program. Added 2026-09-07 with the new panel.
+#
+# WHY THIS EXISTS AT ALL. Before this, the playbook set
+#   org.cinnamon.desktop.screensaver idle-activation-enabled false
+#   org.cinnamon.settings-daemon.plugins.power sleep-display-ac 3600
+# so the LinuxCNC GUI -- a static layout, the same DRO digits and toolbar in
+# the same pixels -- sat lit for an hour at a time, and cncpc idles at that
+# GUI far more than it cuts. On the 2494L that costs two things: LED backlight
+# hours (rated in the tens of thousands, and burned at 8760/year if the panel
+# never sleeps) and image sticking, which is what an industrial LCD gets
+# instead of OLED burn-in when it holds one static frame for months.
+#
+# WHY IT IS NOT JUST A SHORTER TIMEOUT. The 2494L is a TOUCHSCREEN, and DPMS
+# only powers the panel down -- X stays fully live behind it. A touch on a
+# dark-but-live screen is delivered to whatever is under the finger, so the
+# operator's "wake it up" tap IS a click in the LinuxCNC GUI, blind, at
+# whatever coordinate they happened to reach for. That is a button press on a
+# machine tool. The fix is the cinnamon-screensaver overlay (re-enabled by
+# this playbook, WITHOUT lock -- see the gsettings tasks): it takes an input
+# grab, so the waking touch is consumed dismissing it rather than delivered
+# to AXIS. DPMS still powers the panel down behind the overlay, so the
+# backlight saving is unchanged. Blank timeout without the overlay would have
+# traded a monitor problem for a safety problem.
+#
+# WHAT IT DOES, and the two layers it has to hold. There is no single switch,
+# because two independent things blank this screen:
+#
+#   1. cinnamon-settings-daemon's power plugin + cinnamon-screensaver, driven
+#      by the SESSION idle timer. Held off with a org.freedesktop.ScreenSaver
+#      Inhibit cookie -- the supported mechanism, the one video players use,
+#      and the one csd-power actually checks. The cookie lives and dies with
+#      this process's D-Bus connection, so a crash releases it rather than
+#      wedging the screen on forever.
+#
+#   2. The X server's own DPMS timers. Held off with `xset -dpms`. This is the
+#      backstop for the case where csd-power re-asserts DPMS out from under
+#      the inhibit; it is re-applied every poll, so it self-heals within one
+#      POLL_SECS rather than needing to win a race.
+#
+# DELIBERATELY NOT USED: synthetic input. The obvious way to keep a screen
+# awake is xdotool nudging a key or the pointer, and on a CNC that is a
+# loaded gun -- a fake keystroke into AXIS is a jog, an estop toggle, or a
+# spindle command depending on what has focus. Nothing in this script ever
+# injects an event. It changes blanking policy and nothing else.
+#
+# FAIL-SAFE DIRECTION. Every error path treats the machine as IDLE, which
+# means "let the screen blank". A broken guard costs a dark screen the
+# operator wakes with a touch; the opposite default would silently cook the
+# panel for months and report nothing. On exit, DPMS is restored so a stopped
+# guard cannot leave the display pinned on.
+
+import os
+import signal
+import subprocess
+import sys
+import time
+
+POLL_SECS = float(os.environ.get("CNCPC_POLL_SECS", "10"))
+BLANK_SECS = int(os.environ.get("CNCPC_BLANK_SECS", "600"))
+
+# Not a real DISPLAY default so much as an assertion about this host: cncpc is
+# single-head and lightdm owns :0, which is the same assumption
+# files/x11vnc.service already hardcodes as `-display :0`.
+DISPLAY = os.environ.get("DISPLAY") or ":0"
+
+
+def log(msg):
+    print(f"cncpc-display-guard: {msg}", flush=True)
+
+
+def xset(*args):
+    """Run xset against the session display. Returns True on success.
+
+    Never raises: a display that has gone away (session logout, X restart)
+    must not take the guard down with it -- systemd would restart it into the
+    same wall. The loop just keeps polling until X comes back.
+    """
+    env = dict(os.environ, DISPLAY=DISPLAY)
+    try:
+        subprocess.run(
+            ["xset", *args],
+            env=env,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        return True
+    except Exception:
+        return False
+
+
+class Inhibitor:
+    """Holds a org.freedesktop.ScreenSaver inhibit cookie while a job runs.
+
+    Optional by design. If python3-dbus is missing or the session bus is not
+    reachable, the guard degrades to the xset layer alone -- which still stops
+    the panel powering down mid-cut. It just means the screensaver OVERLAY may
+    appear over a running job, which is ugly and safe, rather than absent and
+    silently unprotected.
+    """
+
+    def __init__(self):
+        self.iface = None
+        self.cookie = None
+        try:
+            import dbus
+
+            bus = dbus.SessionBus()
+            obj = bus.get_object(
+                "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"
+            )
+            self.iface = dbus.Interface(obj, "org.freedesktop.ScreenSaver")
+        except Exception as exc:
+            log(f"screensaver inhibit unavailable ({exc}); falling back to xset only")
+
+    def acquire(self):
+        if self.iface is None or self.cookie is not None:
+            return
+        try:
+            self.cookie = self.iface.Inhibit(
+                "cncpc-display-guard", "LinuxCNC program running"
+            )
+        except Exception as exc:
+            log(f"inhibit failed: {exc}")
+            self.cookie = None
+
+    def release(self):
+        if self.iface is None or self.cookie is None:
+            return
+        try:
+            self.iface.UnInhibit(self.cookie)
+        except Exception as exc:
+            log(f"uninhibit failed: {exc}")
+        self.cookie = None
+
+
+class MachineState:
+    """Answers one question: is LinuxCNC doing something worth watching?
+
+    'Busy' is deliberately WIDER than 'a G-code program is streaming'. A
+    paused program, a machine sitting in feed hold, a spinning spindle and an
+    MDI move are all states where the operator is at the machine and wants the
+    DRO visible. Only a genuinely quiet interpreter on an idle task counts as
+    idle. Erring wide costs backlight hours; erring narrow blanks the screen
+    on someone mid-job, which is the failure that would get this reverted.
+    """
+
+    def __init__(self):
+        self.stat = None
+        self.linuxcnc = None
+        self.complained = False
+
+    def _connect(self):
+        if self.stat is not None:
+            return True
+        try:
+            import linuxcnc
+
+            self.linuxcnc = linuxcnc
+            self.stat = linuxcnc.stat()
+            log("connected to LinuxCNC status")
+            self.complained = False
+            return True
+        except Exception as exc:
+            if not self.complained:
+                log(f"LinuxCNC status unavailable ({exc}); treating as idle")
+                self.complained = True
+            return False
+
+    def busy(self):
+        if not self._connect():
+            return False
+        lc = self.linuxcnc
+        try:
+            self.stat.poll()
+        except Exception as exc:
+            # LinuxCNC exited underneath us. Drop the handle so the next pass
+            # reconnects rather than polling a dead NML channel forever.
+            if not self.complained:
+                log(f"LinuxCNC poll failed ({exc}); treating as idle")
+                self.complained = True
+            self.stat = None
+            return False
+
+        try:
+            if self.stat.interp_state != lc.INTERP_IDLE:
+                return True
+            if self.stat.state == lc.RCS_EXEC:
+                return True
+            # Spindle shape changed in 2.9 (a list of per-spindle dicts).
+            # Guarded rather than assumed: a spindle attribute that does not
+            # look the way this expects must not make the whole check throw
+            # and fail the machine to 'idle' while it is actually cutting.
+            for spindle in getattr(self.stat, "spindle", []):
+                if spindle.get("enabled"):
+                    return True
+        except Exception as exc:
+            if not self.complained:
+                log(f"status read failed ({exc}); treating as idle")
+                self.complained = True
+            return False
+
+        return False
+
+
+def apply_idle():
+    """Normal policy: let X power the panel down after BLANK_SECS."""
+    xset("+dpms")
+    # standby and suspend are 0 (off) on purpose. They are intermediate
+    # power states this panel gains nothing from; go straight to off at the
+    # one timeout the rest of the config is written around.
+    xset("dpms", "0", "0", str(BLANK_SECS))
+
+
+def apply_busy():
+    """Job running: DPMS off entirely, and wake the panel if it is already dark.
+
+    'force on' covers the case where a program starts while the screen is
+    already asleep -- a run begun from the touchscreen after a long idle, or
+    over VNC. Without it the first minutes of a job would play to a dark room.
+    """
+    xset("-dpms")
+    xset("dpms", "force", "on")
+
+
+def main():
+    running = {"stop": False}
+
+    def handle(signum, _frame):
+        running["stop"] = True
+
+    signal.signal(signal.SIGTERM, handle)
+    signal.signal(signal.SIGINT, handle)
+
+    inhibitor = Inhibitor()
+    machine = MachineState()
+    was_busy = None
+
+    log(f"started: display={DISPLAY} blank={BLANK_SECS}s poll={POLL_SECS}s")
+
+    try:
+        while not running["stop"]:
+            busy = machine.busy()
+
+            if busy != was_busy:
+                log("program running: holding display on" if busy
+                    else f"machine idle: display may blank after {BLANK_SECS}s")
+                was_busy = busy
+
+            # Applied every pass, not just on transitions. csd-power re-asserts
+            # DPMS from gsettings whenever the session idle state changes, so
+            # edge-triggering alone would lose the panel to a race it cannot
+            # see. Re-applying is idempotent and costs one xset per poll.
+            if busy:
+                inhibitor.acquire()
+                apply_busy()
+            else:
+                inhibitor.release()
+                apply_idle()
+
+            time.sleep(POLL_SECS)
+    finally:
+        # Leave the display BLANKABLE, never pinned on. A guard that dies
+        # holding '-dpms' would be indistinguishable from the 3600s config
+        # this replaced, and would fail silently for as long as nobody looked.
+        inhibitor.release()
+        apply_idle()
+        log("stopped: DPMS restored")
+
+
+if __name__ == "__main__":
+    sys.exit(main())

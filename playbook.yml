@@ -11,6 +11,27 @@
     # play's play-level become: yes. Override with -e dcnc_user=<name>.
     dcnc_user: evand
 
+    # DISPLAY BLANKING, added 2026-09-07 with the Elo 2494L. Two timeouts, not
+    # one, and the order between them is load-bearing: the screensaver overlay
+    # has to be up and holding an input grab BEFORE the panel goes dark, or the
+    # touch that wakes the screen lands in AXIS instead (see the display policy
+    # block below). Keep idle < blank.
+    #
+    # 10 minutes is chosen against how cncpc is actually used, not as a round
+    # number: long enough that reading a tool table or squinting at a backplot
+    # never blanks on you, short enough that the overnight and between-jobs
+    # idling -- which is most of this machine's powered hours -- stops burning
+    # backlight. It costs nothing during a job, because the guard suspends both
+    # timeouts while the interpreter is running.
+    cncpc_display_idle_secs: 600
+    cncpc_display_blank_secs: 660
+
+    # How often the guard asks LinuxCNC whether it is busy. This is also the
+    # worst-case window in which a display that blanked just as a program
+    # started gets forced back on, so it wants to stay small; it is two
+    # subprocess-free status polls and at most two xset calls per tick.
+    cncpc_display_poll_secs: 10
+
     # WHERE THE RESTIC BACKUP LIVES. Defaults ARE the production values, so an
     # un-overridden run behaves exactly as before -- the template renders
     # byte-identical to the script these replaced, and that is asserted rather
@@ -256,6 +277,13 @@
           - git
           - cinnamon
           - x11vnc
+          # for /usr/local/bin/cncpc-display-guard: xset lives in
+          # x11-xserver-utils, and the org.freedesktop.ScreenSaver inhibit
+          # needs a persistent session-bus connection, which means the dbus
+          # python bindings rather than a one-shot `gdbus call` (a cookie dies
+          # with the connection that took it, so the CLI cannot hold one).
+          - x11-xserver-utils
+          - python3-dbus
         state: present
         update_cache: yes
 
@@ -268,26 +296,119 @@
         backup: yes
       notify: restart lightdm
 
-    - name: disable screensaver in cinnamon
+    # ==========================================================================
+    # DISPLAY POLICY -- rewritten 2026-09-07, when the panel became an Elo
+    # 2494L. What was here before was three settings that between them meant
+    # "never blank": lock off, idle activation OFF, and display sleep at 3600s.
+    # On a machine that idles at a static LinuxCNC GUI far more than it cuts,
+    # that is an hour of unchanging DRO digits in fixed pixels, forever.
+    #
+    # The 2494L is an LED-backlit industrial LCD, so the risk is NOT OLED
+    # burn-in. It is backlight hours -- a panel that never sleeps burns 8760 a
+    # year against a rating in the tens of thousands -- and image sticking,
+    # which is what an LCD holding one frame for months gets instead.
+    #
+    # THE PART THAT IS NOT ABOUT THE MONITOR. The 2494L is a TOUCHSCREEN, and
+    # this is why "just shorten the timeout" was the wrong patch. DPMS powers
+    # the panel down but leaves X fully live, so a touch on a dark screen is
+    # delivered straight to whatever sits under the finger -- the operator's
+    # wake-up tap becomes a blind click in AXIS, at a coordinate they did not
+    # choose, on a machine tool. So idle-activation-enabled is turned back ON:
+    # cinnamon-screensaver takes an input grab, and the waking touch is spent
+    # dismissing the overlay instead of pressing a button. The panel still
+    # powers down behind it, so nothing is given up on the backlight.
+    #
+    # lock-enabled STAYS false. The overlay is there to eat one touch, not to
+    # put a password prompt between an operator and a running machine.
+    #
+    # The two timeouts are staggered on purpose: the overlay at
+    # cncpc_display_idle_secs, the panel off a minute later at
+    # cncpc_display_blank_secs, so the grab is already in place before the
+    # screen goes dark. Neither fires while a program is running --
+    # /usr/local/bin/cncpc-display-guard below holds both off for that.
+    #
+    # These run as the INVOKING user, not root: gsettings writes through the
+    # caller's session D-Bus to the caller's dconf, so a value set as root
+    # lands in root's dconf and the operator's session never sees it. That is
+    # what `become: no` is for here. The inert
+    # `become_user: ansible_env.USER` expression these tasks used to carry is
+    # dropped -- with become off it did nothing, and it named the very
+    # expression the Adafruit block below documents as rendering "root".
+    # It also means these three want a run from a terminal INSIDE the Cinnamon
+    # session, which is how this playbook is invoked anyway (hosts: local).
+    # ==========================================================================
+    - name: do not lock the screen (the operator must never meet a password prompt)
       ansible.builtin.command:
         cmd: gsettings set org.cinnamon.desktop.screensaver lock-enabled false
       become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
       changed_when: false
 
-    - name: disable screensaver idle activation
+    - name: enable the screensaver overlay, so a waking touch is not a click in AXIS
       ansible.builtin.command:
-        cmd: gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled false
+        cmd: gsettings set org.cinnamon.desktop.screensaver idle-activation-enabled true
       become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
       changed_when: false
 
-    - name: set screen to turn off after 1 hour
+    - name: show the screensaver overlay after {{ cncpc_display_idle_secs }}s idle
       ansible.builtin.command:
-        cmd: gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-ac 3600
+        cmd: >-
+          gsettings set org.cinnamon.desktop.session idle-delay
+          'uint32 {{ cncpc_display_idle_secs }}'
       become: no
-      become_user: "{{ ansible_env.USER | default(ansible_user_id) }}"
       changed_when: false
+
+    - name: power the panel down after {{ cncpc_display_blank_secs }}s idle
+      ansible.builtin.command:
+        cmd: >-
+          gsettings set org.cinnamon.settings-daemon.plugins.power sleep-display-ac
+          {{ cncpc_display_blank_secs }}
+      become: no
+      changed_when: false
+
+    - name: install the display guard
+      ansible.builtin.copy:
+        src: files/cncpc-display-guard
+        dest: /usr/local/bin/cncpc-display-guard
+        owner: root
+        group: root
+        mode: '0755'
+      notify: restart display guard
+
+    - name: install the display guard user unit
+      ansible.builtin.template:
+        src: templates/cncpc-display-guard.service.j2
+        dest: /etc/systemd/user/cncpc-display-guard.service
+        owner: root
+        group: root
+        mode: '0644'
+      notify:
+        - reload systemd
+        - restart display guard
+
+    # --global, not --user. Enabling a user unit the ordinary way needs a live
+    # user bus for {{ dcnc_user }}, which a provisioning run cannot count on
+    # having (and definitely does not have on a first boot before anyone has
+    # logged in). --global writes the wants symlink under /etc/systemd/user/
+    # instead, so the unit is enabled for the next session whether or not one
+    # exists right now.
+    - name: enable the display guard for every graphical session
+      ansible.builtin.command:
+        cmd: systemctl --global enable cncpc-display-guard.service
+      register: display_guard_enable
+      changed_when: "'Created symlink' in display_guard_enable.stderr"
+
+    # Best-effort, and non-fatal on purpose. If the playbook is being run from
+    # a desktop terminal there IS a session to start this in and the guard
+    # should begin working now rather than at next login. If there is not --
+    # a headless first provision, a run over SSH -- the --global enable above
+    # has already done the durable half and this is noise, not a failure.
+    - name: start the display guard in the current session if there is one
+      ansible.builtin.command:
+        cmd: systemctl --user start cncpc-display-guard.service
+      become: no
+      register: display_guard_start
+      changed_when: display_guard_start.rc == 0
+      failed_when: false
 
     - name: create x11vnc password file
       ansible.builtin.shell:
@@ -762,6 +883,19 @@
       ansible.builtin.systemd:
         name: x11vnc
         state: restarted
+
+    # become: no because this is a USER unit -- `systemctl --user` as root
+    # addresses root's manager, which is not the one running the guard.
+    # failed_when: false because a provisioning run with no graphical session
+    # has nothing to restart, and that is not an error; the --global enable
+    # has already arranged for the next login to pick the new file up.
+    - name: restart display guard
+      ansible.builtin.command:
+        cmd: systemctl --user restart cncpc-display-guard.service
+      become: no
+      register: display_guard_restart
+      changed_when: display_guard_restart.rc == 0
+      failed_when: false
 
     - name: reload udev rules
       ansible.builtin.shell:

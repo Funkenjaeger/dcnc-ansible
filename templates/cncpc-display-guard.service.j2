@@ -1,0 +1,37 @@
+# /etc/systemd/user/cncpc-display-guard.service (cncpc, installed by this playbook)
+#
+# A USER unit, not a system one, unlike its neighbour files/x11vnc.service.
+# That is deliberate: the guard has to reach the SESSION D-Bus bus to hold a
+# org.freedesktop.ScreenSaver inhibit, and root has no session bus to reach.
+# Running it inside {{ dcnc_user }}'s systemd instance gets DISPLAY,
+# XAUTHORITY and DBUS_SESSION_BUS_ADDRESS for free -- Debian's
+# /etc/X11/Xsession.d/95dbus_update-activation-env pushes them into the user
+# manager's environment at session start.
+#
+# WantedBy=default.target, NOT graphical-session.target. Cinnamon's coverage
+# of graphical-session.target on Debian 12 is not something this playbook can
+# verify from here, and a unit wanted by a target that is never reached is a
+# unit that silently never runs. default.target is reached by user@<uid>.service
+# whenever {{ dcnc_user }} logs in, which is the condition that actually
+# matters. The script does not assume X is up at start -- every xset call
+# tolerates a missing display and the poll loop simply retries -- so starting
+# early is harmless.
+
+[Unit]
+Description=Hold cncpc's display awake while LinuxCNC runs a program
+Documentation=file:/usr/local/bin/cncpc-display-guard
+
+[Service]
+Type=simple
+Environment=CNCPC_BLANK_SECS={{ cncpc_display_blank_secs }}
+Environment=CNCPC_POLL_SECS={{ cncpc_display_poll_secs }}
+ExecStart=/usr/local/bin/cncpc-display-guard
+# Restart=always, not on-failure: a clean exit here is still a display with
+# nothing watching it. RestartSec spelled correctly on purpose -- cf.
+# files/x11vnc.service, which carries "Restart-sec=2" and therefore has no
+# restart delay at all.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
