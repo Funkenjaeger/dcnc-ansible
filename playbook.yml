@@ -621,26 +621,54 @@
       changed_when: false
       failed_when: false
 
-    - name: fail when lightdm does not pick up the greeter blanking script
+    # SILENCE IS NOT A NEGATIVE ANSWER. The first version of this check failed
+    # the run whenever 'cncpc-greeter-blank' was absent from stdout -- and on
+    # cncpc `lightdm --show-config` exits 0 having printed NOTHING to stdout,
+    # so the check aborted a provisioning run while reporting
+    # "What lightdm reports: " with nothing after the colon. Empty.
+    #
+    # That is the same defect this playbook has now been bitten by three times:
+    # ansible's apt module reporting a repo failure with no reason, the display
+    # guard logging a blanking policy it never applied, and now a verification
+    # step concluding from an answer it never received. An absent answer and a
+    # negative answer are different facts, and only one of them justifies
+    # stopping. Read stderr too -- some builds print the merged config there --
+    # and treat an empty response as UNVERIFIED, which is reported and
+    # survivable, rather than as a failure, which is neither.
+    - name: gather everything lightdm said, on either stream
+      ansible.builtin.set_fact:
+        lightdm_config_text: >-
+          {{ (lightdm_config.stdout | default('')) + ' '
+             + (lightdm_config.stderr | default('')) }}
+
+    - name: fail when lightdm reports a config that omits the greeter blanking script
       ansible.builtin.fail:
         msg: >-
-          lightdm --show-config does not mention cncpc-greeter-blank, so the
-          drop-in at /etc/lightdm/lightdm.conf.d/50-cncpc-display.conf is being
-          ignored and the greeter will never blank. Most likely cause: a
+          lightdm reported its merged config and cncpc-greeter-blank is not in
+          it, so the drop-in at
+          /etc/lightdm/lightdm.conf.d/50-cncpc-display.conf is being ignored and
+          the greeter will never blank. Most likely cause: a
           display-setup-script already set in /etc/lightdm/lightdm.conf, which
-          takes precedence over every drop-in. What lightdm reports:
-          {{ lightdm_config.stdout | default('') | trim }}
+          takes precedence over every drop-in. What lightdm reported:
+          {{ lightdm_config_text | trim }}
       when:
         - lightdm_config.rc == 0
-        - "'cncpc-greeter-blank' not in (lightdm_config.stdout | default(''))"
+        - lightdm_config_text | trim | length > 0
+        - "'cncpc-greeter-blank' not in lightdm_config_text"
 
     - name: report when lightdm could not be asked
       ansible.builtin.debug:
         msg: >-
-          `lightdm --show-config` exited {{ lightdm_config.rc }}, so whether the
-          drop-in is read has NOT been verified. Check by hand before trusting
-          the greeter to blank.
-      when: lightdm_config.rc != 0
+          NOT VERIFIED: `lightdm --show-config` exited {{ lightdm_config.rc }}
+          and said {{ lightdm_config_text | trim | length }} bytes, so whether
+          the drop-in is read has not been established either way. The greeter
+          blanking below is still installed and still applied to the running
+          display; what is unproven is whether it survives the NEXT display
+          setup. Check by hand with `sudo lightdm --show-config` before
+          trusting an unattended reboot to blank.
+      when: >-
+        lightdm_config.rc != 0
+        or (lightdm_config_text | trim | length) == 0
 
     # DELIBERATELY DOES NOT notify 'restart lightdm'. display-setup-script only
     # takes effect at the next display setup, and the obvious way to force that
