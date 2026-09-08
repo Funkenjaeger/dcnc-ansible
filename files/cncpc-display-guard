@@ -72,12 +72,48 @@ def log(msg):
     print(f"cncpc-display-guard: {msg}", flush=True)
 
 
+class EdgeLog:
+    """Log only when a condition CHANGES, never while it merely persists.
+
+    Added 2026-09-07, after the first version shipped a log that said the same
+    two things forever. Both of this daemon's inputs are legitimately absent
+    for hours at a time -- LinuxCNC is not running, nobody is logged in
+    graphically -- and the first version reported each unchanged condition
+    every POLL_SECS. At the default 10s that is 17,280 lines a day, in which a
+    real transition is invisible.
+
+    The bug that made it loud was subtler than volume, though: linuxcnc.stat()
+    CONSTRUCTS fine when LinuxCNC is down, because it does not connect until
+    poll(). So the old code logged "connected", then logged the poll failure,
+    then cleared its own already-complained flag, and did all three again ten
+    seconds later. A latch that gets reset by the failure path is not a latch.
+    """
+
+    _UNSET = object()
+
+    def __init__(self):
+        self._state = self._UNSET
+
+    def note(self, state, msg):
+        if state != self._state:
+            log(msg)
+            self._state = state
+
+
 def xset(*args):
     """Run xset against the session display. Returns True on success.
 
     Never raises: a display that has gone away (session logout, X restart)
     must not take the guard down with it -- systemd would restart it into the
     same wall. The loop just keeps polling until X comes back.
+
+    The RETURN VALUE IS LOAD-BEARING and the caller must not drop it. The first
+    version discarded it, so when the guard could not reach :0 -- nobody logged
+    in graphically, wrong XAUTHORITY -- every call failed silently and the loop
+    went on logging "machine idle: display may blank after 660s" while applying
+    no policy at all. It described a display it could not touch. Reporting
+    correct-looking intent you did not carry out is worse than reporting
+    nothing: it sends whoever is debugging it somewhere else entirely.
     """
     env = dict(os.environ, DISPLAY=DISPLAY)
     try:
@@ -153,39 +189,40 @@ class MachineState:
     def __init__(self):
         self.stat = None
         self.linuxcnc = None
-        self.complained = False
-
-    def _connect(self):
-        if self.stat is not None:
-            return True
-        try:
-            import linuxcnc
-
-            self.linuxcnc = linuxcnc
-            self.stat = linuxcnc.stat()
-            log("connected to LinuxCNC status")
-            self.complained = False
-            return True
-        except Exception as exc:
-            if not self.complained:
-                log(f"LinuxCNC status unavailable ({exc}); treating as idle")
-                self.complained = True
-            return False
+        self.health = EdgeLog()
 
     def busy(self):
-        if not self._connect():
-            return False
+        # Connect and poll in ONE step, and judge health by the POLL. A bare
+        # linuxcnc.stat() succeeds against a machine with no LinuxCNC running
+        # on it, so construction proves nothing and must not be reported as
+        # success -- that was the whole log-spam bug.
+        if self.stat is None:
+            try:
+                import linuxcnc
+
+                self.linuxcnc = linuxcnc
+                self.stat = linuxcnc.stat()
+            except Exception as exc:
+                self.health.note(
+                    False, f"LinuxCNC unavailable ({exc}); treating as idle"
+                )
+                return False
+
         lc = self.linuxcnc
         try:
             self.stat.poll()
         except Exception as exc:
-            # LinuxCNC exited underneath us. Drop the handle so the next pass
-            # reconnects rather than polling a dead NML channel forever.
-            if not self.complained:
-                log(f"LinuxCNC poll failed ({exc}); treating as idle")
-                self.complained = True
+            # LinuxCNC is not up, or exited underneath us. Drop the handle so
+            # the next pass rebuilds it rather than polling a dead NML channel
+            # forever -- the buffer is recreated when LinuxCNC restarts, and a
+            # stale object does not pick that up.
+            self.health.note(
+                False, f"LinuxCNC status unavailable ({exc}); treating as idle"
+            )
             self.stat = None
             return False
+
+        self.health.note(True, "LinuxCNC status connected")
 
         try:
             if self.stat.interp_state != lc.INTERP_IDLE:
@@ -200,9 +237,7 @@ class MachineState:
                 if spindle.get("enabled"):
                     return True
         except Exception as exc:
-            if not self.complained:
-                log(f"status read failed ({exc}); treating as idle")
-                self.complained = True
+            log(f"status read failed ({exc}); treating as idle")
             return False
 
         return False
@@ -210,11 +245,10 @@ class MachineState:
 
 def apply_idle():
     """Normal policy: let X power the panel down after BLANK_SECS."""
-    xset("+dpms")
     # standby and suspend are 0 (off) on purpose. They are intermediate
     # power states this panel gains nothing from; go straight to off at the
     # one timeout the rest of the config is written around.
-    xset("dpms", "0", "0", str(BLANK_SECS))
+    return xset("+dpms") and xset("dpms", "0", "0", str(BLANK_SECS))
 
 
 def apply_busy():
@@ -224,8 +258,7 @@ def apply_busy():
     already asleep -- a run begun from the touchscreen after a long idle, or
     over VNC. Without it the first minutes of a job would play to a dark room.
     """
-    xset("-dpms")
-    xset("dpms", "force", "on")
+    return xset("-dpms") and xset("dpms", "force", "on")
 
 
 def main():
@@ -239,6 +272,7 @@ def main():
 
     inhibitor = Inhibitor()
     machine = MachineState()
+    display = EdgeLog()
     was_busy = None
 
     log(f"started: display={DISPLAY} blank={BLANK_SECS}s poll={POLL_SECS}s")
@@ -258,10 +292,19 @@ def main():
             # see. Re-applying is idempotent and costs one xset per poll.
             if busy:
                 inhibitor.acquire()
-                apply_busy()
+                reached = apply_busy()
             else:
                 inhibitor.release()
-                apply_idle()
+                reached = apply_idle()
+
+            display.note(
+                reached,
+                f"display {DISPLAY} reachable; blanking policy applied"
+                if reached else
+                f"CANNOT REACH display {DISPLAY} -- blanking policy NOT "
+                "applied. Is anyone logged in graphically? The guard keeps "
+                "polling and picks the session up when it appears.",
+            )
 
             time.sleep(POLL_SECS)
     finally:
