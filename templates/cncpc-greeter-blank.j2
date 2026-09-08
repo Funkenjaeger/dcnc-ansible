@@ -1,0 +1,47 @@
+#!/bin/sh
+# /usr/local/bin/cncpc-greeter-blank (cncpc, installed by this playbook)
+#
+# Blank the panel at the LIGHTDM GREETER. Added 2026-09-07.
+#
+# WHY THIS EXISTS SEPARATELY from cncpc-display-guard. The guard is a USER
+# service and can only reach the logged-in session's X server. The greeter runs
+# on a DIFFERENT X server, owned by lightdm with a root-only auth file, so the
+# guard cannot touch it -- and correctly reported "CANNOT REACH display :0" for
+# every second cncpc sat at the login screen.
+#
+# That state is NOT rare, which is the whole point. cncpc returns to the
+# greeter after any unattended reboot -- a power interruption, a watchdog, an
+# overnight update -- and can sit there for days showing one static login form:
+# the same fixed pixels and the same backlight hours the guard exists to
+# prevent, in the one state nobody is present to notice. Protection that only
+# works while an operator is already logged in is not protection.
+#
+# lightdm runs this as root via display-setup-script, with DISPLAY and
+# XAUTHORITY already set for the server it just started.
+#
+# NO SCREENSAVER OVERLAY HERE, unlike the session, and that is deliberate. The
+# overlay exists in the session to swallow the touch that wakes a dark 2494L,
+# because in AXIS that touch would otherwise be a blind button press on a
+# machine tool. At the greeter the worst a stray touch can do is put a
+# character in a password field or nudge the session picker. Nothing can move.
+# So plain X-level blanking is enough, and it has the advantage of working
+# whatever greeter is installed.
+#
+# THIS SCRIPT MUST NEVER FAIL. lightdm runs display-setup-script during display
+# setup, and a nonzero exit there can stop the greeter from coming up at all --
+# which on this machine means a CNC that boots to nothing after a power cut,
+# caused by the very script meant to protect its monitor. Every command is
+# therefore forgiving and the exit is unconditionally 0.
+
+# {{ cncpc_display_idle_secs }}s: blank the static greeter, matching the
+# session's idle-delay. Second argument is the cycle interval; equal to the
+# timeout means "blank and stay blanked" rather than periodically redrawing.
+xset s {{ cncpc_display_idle_secs }} {{ cncpc_display_idle_secs }} 2>/dev/null || true
+
+# Then cut the backlight a minute later, matching the session's
+# sleep-display-ac. standby and suspend are 0 (off): intermediate power states
+# buy this panel nothing, so go straight to off at one timeout.
+xset +dpms 2>/dev/null || true
+xset dpms 0 0 {{ cncpc_display_blank_secs }} 2>/dev/null || true
+
+exit 0

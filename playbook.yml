@@ -550,6 +550,85 @@
       changed_when: display_guard_start.rc == 0
       failed_when: false
 
+    # ==========================================================================
+    # THE GREETER -- added 2026-09-07, because the guard above cannot protect
+    # the state this machine spends its unattended hours in.
+    #
+    # cncpc returns to the lightdm login screen after any unattended reboot: a
+    # power interruption, a watchdog, an overnight update. Measured on the live
+    # machine the same day, sitting at exactly that screen:
+    #     Xorg :0 -seat seat0 -auth /var/run/lightdm/root/:0 ... vt7
+    #     session c2  lightdm  seat0  greeter
+    # The greeter's X IS :0, but its auth cookie is lightdm's root-only file,
+    # while the guard -- a USER service -- holds evand's ~/.Xauthority. So the
+    # guard is locked out and logs "CANNOT REACH display :0", correctly, for
+    # every second the machine sits there. It is not a bug in the guard; a user
+    # service cannot reach a display it has no cookie for, and should not.
+    #
+    # The consequence is what matters: without this, the display policy covers
+    # only the logged-in session, and the greeter -- one static login form,
+    # unattended, potentially for days -- is precisely the burn-in and
+    # backlight-hours case nobody is present to notice. Protection that needs
+    # an operator already sitting there is not protection.
+    #
+    # lightdm's display-setup-script hook runs as root, at display setup, with
+    # DISPLAY and XAUTHORITY already correct for the server it just started.
+    # That is the one place this can be done without handing anybody lightdm's
+    # cookie.
+    # ==========================================================================
+    - name: install the greeter blanking script
+      ansible.builtin.template:
+        src: templates/cncpc-greeter-blank.j2
+        dest: /usr/local/bin/cncpc-greeter-blank
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: point lightdm at the greeter blanking script
+      ansible.builtin.template:
+        src: templates/lightdm-cncpc-display.conf.j2
+        dest: /etc/lightdm/lightdm.conf.d/50-cncpc-display.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    # DELIBERATELY DOES NOT notify 'restart lightdm'. display-setup-script only
+    # takes effect at the next display setup, and the obvious way to force that
+    # -- restarting lightdm -- KILLS THE LOGGED-IN SESSION, which on this
+    # machine can mean killing LinuxCNC mid-job. A playbook run must never do
+    # that as a side effect of a monitor setting. Apply it to the server that
+    # is already running instead; the drop-in covers every display setup after
+    # this one.
+    #
+    # The auth path is read off the RUNNING server rather than assumed to be
+    # /var/run/lightdm/root/:0. That is what it happens to be today, and it is
+    # a lightdm implementation detail that a version bump is free to change.
+    # Guarded at every step: no Xorg, no -auth, or a script that fails all exit
+    # 0 with a message, because a monitor tweak is not worth failing a rebuild.
+    - name: apply greeter blanking to the X server already running
+      ansible.builtin.shell:
+        cmd: |
+          set -u
+          AUTH=$(ps -C Xorg -o args= | sed -n 's/.*-auth \([^ ]*\).*/\1/p' | head -1)
+          if [ -z "$AUTH" ]; then
+            echo "no running Xorg with an -auth file; the drop-in covers the next start"
+            exit 0
+          fi
+          if [ ! -r "$AUTH" ]; then
+            echo "cannot read $AUTH; the drop-in covers the next start"
+            exit 0
+          fi
+          # :0 to match files/x11vnc.service, which makes the same single-seat
+          # assumption about this host.
+          DISPLAY=:0 XAUTHORITY="$AUTH" /usr/local/bin/cncpc-greeter-blank
+          echo "applied to the running display via $AUTH"
+      register: greeter_blank_now
+      changed_when: "'applied to the running display' in greeter_blank_now.stdout"
+
+    - name: report what the greeter blanking did
+      ansible.builtin.debug:
+        msg: "{{ greeter_blank_now.stdout | trim }}"
+
     - name: create x11vnc password file
       ansible.builtin.shell:
         cmd: 'printf "{{ vnc_password }}\n{{ vnc_password }}\n" | x11vnc -storepasswd /etc/x11vnc.pass'

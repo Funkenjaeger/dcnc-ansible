@@ -1,0 +1,10 @@
+# /etc/lightdm/lightdm.conf.d/50-cncpc-display.conf (installed by this playbook)
+#
+# A conf.d DROP-IN rather than another lineinfile edit to lightdm.conf, so the
+# display policy is one removable file instead of a line interleaved with the
+# user-session setting. Note the precedence if this ever seems ignored: lightdm
+# reads /usr/share/lightdm/lightdm.conf.d/, then /etc/lightdm/lightdm.conf.d/,
+# then /etc/lightdm/lightdm.conf -- the monolithic file wins over the drop-ins,
+# so a display-setup-script added there later would silently override this one.
+[Seat:*]
+display-setup-script=/usr/local/bin/cncpc-greeter-blank

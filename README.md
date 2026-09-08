@@ -167,6 +167,10 @@ and looks green. Check the recap names a host before believing a clean run.
 23. **install the display guard user unit** - `/etc/systemd/user/cncpc-display-guard.service`
 24. **enable the display guard for every graphical session** - `systemctl --global enable`
 25. **start the display guard in the current session if there is one** - Best-effort, non-fatal
+26. **install the greeter blanking script** - `/usr/local/bin/cncpc-greeter-blank`
+27. **point lightdm at the greeter blanking script** - `lightdm.conf.d` drop-in
+28. **apply greeter blanking to the X server already running** - No lightdm restart, so no session is killed
+29. **report what the greeter blanking did** - Says whether it reached a live display
 
 ### 🌐 Remote Access (VNC)
 21. **create x11vnc password file** - Generate encrypted password file (conditional)
@@ -283,11 +287,58 @@ depending on focus. The guard changes blanking policy and nothing else.
 Tuning: `cncpc_display_idle_secs`, `cncpc_display_blank_secs` and
 `cncpc_display_poll_secs` at the top of the playbook. Keep idle < blank.
 
-Watching it work, from a terminal in the desktop session:
+Watching it work (fine over SSH — `systemctl --user` reaches the same user
+manager, since there is one per *user*, not per session):
 
 ```bash
 journalctl --user -fu cncpc-display-guard.service
 ```
+
+#### The greeter is protected separately, and has to be
+
+The guard is a **user** service and can only reach the logged-in session's X
+server. Measured on the live machine sitting at the login screen:
+
+```
+Xorg :0 -seat seat0 -auth /var/run/lightdm/root/:0 ... vt7
+session c2  lightdm  seat0  greeter
+```
+
+The greeter's X **is** `:0`, but its auth cookie is lightdm's root-only file,
+while the guard holds `evand`'s `~/.Xauthority`. So the guard is locked out and
+logs `CANNOT REACH display :0` — correctly — for every second cncpc sits there.
+That is not a defect: a user service cannot reach a display it has no cookie
+for, and should not be given one.
+
+What matters is the consequence. **cncpc returns to the greeter after any
+unattended reboot** — a power interruption, a watchdog, an overnight update —
+and can sit there for days showing one static login form. That is exactly the
+burn-in and backlight-hours case the whole exercise exists to prevent, in the
+one state where nobody is present to notice. Protection that requires an
+operator already logged in is not protection.
+
+So `/usr/local/bin/cncpc-greeter-blank` is wired into lightdm's
+`display-setup-script` hook, which runs as root at display setup with `DISPLAY`
+and `XAUTHORITY` already correct. It applies the same two timeouts at the X
+level — blank at `cncpc_display_idle_secs`, panel off at
+`cncpc_display_blank_secs` — so both states behave identically.
+
+No screensaver overlay there, deliberately: the overlay exists in the session to
+swallow the touch that wakes a dark 2494L, because in AXIS that touch would be a
+blind button press on a machine tool. At the greeter the worst a stray touch can
+do is put a character in a password field. Nothing can move.
+
+**The script exits 0 unconditionally.** A nonzero exit from
+`display-setup-script` can stop the greeter coming up at all — which on this
+machine would mean a CNC that boots to a blank screen after a power cut, caused
+by the script meant to protect its monitor. Every command is forgiving and the
+exit is forced.
+
+Installing it does **not** restart lightdm, because that kills the logged-in
+session and can take LinuxCNC down mid-job. The playbook applies the settings to
+the already-running X server instead, reading the auth path off the live `Xorg`
+process rather than assuming `/var/run/lightdm/root/:0` — that is what lightdm
+uses today, and a version bump is free to change it.
 
 ### System Hardening
 - **Kernel Management**: RT kernel packages held to prevent breaking updates
@@ -364,6 +415,8 @@ dcnc-ansible/
 │   └── x11vnc.service      # x11vnc systemd service definition
 ├── templates/               # Templated files
 │   ├── cncpc-display-guard.service.j2  # user unit for the display guard
+│   ├── cncpc-greeter-blank.j2          # blanks the panel at the lightdm greeter
+│   ├── lightdm-cncpc-display.conf.j2   # drop-in wiring the greeter hook
 │   └── cncpc-restic-backup.sh.j2       # restic backup/prune script
 ├── tests/                   # Runnable checks (no ansible required)
 │   └── test_apt_classification.py      # proves the apt-failure classification
