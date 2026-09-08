@@ -168,9 +168,13 @@ and looks green. Check the recap names a host before believing a clean run.
 24. **enable the display guard for every graphical session** - `systemctl --global enable`
 25. **start the display guard in the current session if there is one** - Best-effort, non-fatal
 26. **install the greeter blanking script** - `/usr/local/bin/cncpc-greeter-blank`
-27. **point lightdm at the greeter blanking script** - `lightdm.conf.d` drop-in
-28. **apply greeter blanking to the X server already running** - No lightdm restart, so no session is killed
-29. **report what the greeter blanking did** - Says whether it reached a live display
+27. **create the lightdm drop-in directory** - Debian ships no `/etc/lightdm/lightdm.conf.d`
+28. **point lightdm at the greeter blanking script** - The drop-in itself
+29. **ask lightdm what config it actually reads** - `lightdm --show-config`
+30. **fail when lightdm does not pick up the greeter blanking script** - Proof, not assumption
+31. **report when lightdm could not be asked** - Says plainly that it is unverified
+32. **apply greeter blanking to the X server already running** - No lightdm restart, so no session is killed
+33. **report what the greeter blanking did** - Says whether it reached a live display
 
 ### 🌐 Remote Access (VNC)
 21. **create x11vnc password file** - Generate encrypted password file (conditional)
@@ -333,6 +337,16 @@ do is put a character in a password field. Nothing can move.
 machine would mean a CNC that boots to a blank screen after a power cut, caused
 by the script meant to protect its monitor. Every command is forgiving and the
 exit is forced.
+
+Debian ships `/usr/share/lightdm/lightdm.conf.d/` but **not**
+`/etc/lightdm/lightdm.conf.d/`, so the playbook creates it. Writing a file into
+a directory you had to create first is exactly the change that silently does
+nothing — and a greeter that never blanks looks identical to one that does,
+until someone walks past the machine weeks later. So the playbook asks
+`lightdm --show-config` what it actually reads and **fails** if the drop-in
+isn't in the merged config. The likeliest reason it wouldn't be: a
+`display-setup-script` already set in `/etc/lightdm/lightdm.conf`, which takes
+precedence over every drop-in.
 
 Installing it does **not** restart lightdm, because that kills the logged-in
 session and can take LinuxCNC down mid-job. The playbook applies the settings to

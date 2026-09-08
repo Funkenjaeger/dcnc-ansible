@@ -584,6 +584,22 @@
         group: root
         mode: '0755'
 
+    # Debian's lightdm package ships /usr/share/lightdm/lightdm.conf.d/ but NOT
+    # /etc/lightdm/lightdm.conf.d/, and ansible.builtin.template does not
+    # create parent directories -- the first run of the task below died on
+    # "Destination directory /etc/lightdm/lightdm.conf.d does not exist".
+    # Creating it is supported: lightdm's documented search order is
+    # /usr/share/lightdm/lightdm.conf.d/, then /etc/lightdm/lightdm.conf.d/,
+    # then /etc/lightdm/lightdm.conf. Supported is not the same as verified,
+    # which is what the check below is for.
+    - name: create the lightdm drop-in directory
+      ansible.builtin.file:
+        path: /etc/lightdm/lightdm.conf.d
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
     - name: point lightdm at the greeter blanking script
       ansible.builtin.template:
         src: templates/lightdm-cncpc-display.conf.j2
@@ -591,6 +607,40 @@
         owner: root
         group: root
         mode: '0644'
+
+    # PROVE the drop-in is read rather than trusting that it is. Writing a file
+    # into a directory that had to be created first is exactly the shape of
+    # change that silently does nothing -- and a greeter that never blanks
+    # would look identical to one that does until someone walked past the
+    # machine weeks later. `lightdm --show-config` prints the MERGED config
+    # with its sources, so it answers the question directly.
+    - name: ask lightdm what config it actually reads
+      ansible.builtin.command:
+        cmd: lightdm --show-config
+      register: lightdm_config
+      changed_when: false
+      failed_when: false
+
+    - name: fail when lightdm does not pick up the greeter blanking script
+      ansible.builtin.fail:
+        msg: >-
+          lightdm --show-config does not mention cncpc-greeter-blank, so the
+          drop-in at /etc/lightdm/lightdm.conf.d/50-cncpc-display.conf is being
+          ignored and the greeter will never blank. Most likely cause: a
+          display-setup-script already set in /etc/lightdm/lightdm.conf, which
+          takes precedence over every drop-in. What lightdm reports:
+          {{ lightdm_config.stdout | default('') | trim }}
+      when:
+        - lightdm_config.rc == 0
+        - "'cncpc-greeter-blank' not in (lightdm_config.stdout | default(''))"
+
+    - name: report when lightdm could not be asked
+      ansible.builtin.debug:
+        msg: >-
+          `lightdm --show-config` exited {{ lightdm_config.rc }}, so whether the
+          drop-in is read has NOT been verified. Check by hand before trusting
+          the greeter to blank.
+      when: lightdm_config.rc != 0
 
     # DELIBERATELY DOES NOT notify 'restart lightdm'. display-setup-script only
     # takes effect at the next display setup, and the obvious way to force that
