@@ -138,11 +138,39 @@ class Inhibitor:
     the panel powering down mid-cut. It just means the screensaver OVERLAY may
     appear over a running job, which is ugly and safe, rather than absent and
     silently unprotected.
+
+    IT MUST KEEP RETRYING, and the first version did not. It connected ONCE, in
+    __init__, and cached the failure forever. That is fatal in practice rather
+    than in theory: this unit is WantedBy=default.target, so it starts when the
+    user manager does -- at boot, or on an ssh login -- which is almost always
+    BEFORE anyone logs in graphically and therefore before cinnamon-screensaver
+    is on the bus. Measured on cncpc: guard started 20:53:01 and logged
+    "screensaver inhibit unavailable"; the session appeared at 20:56:41 and the
+    guard picked up the DISPLAY correctly, but had permanently given up on the
+    inhibit three and a half minutes earlier.
+
+    The cost of that is not cosmetic. Without the inhibit the guard holds DPMS
+    off during a job, so the panel stays lit -- but nothing stops the overlay
+    dropping over a running LinuxCNC GUI after idle-delay, hiding the DRO
+    mid-cut, which is the exact thing the inhibit is here to prevent. So
+    connection is attempted every poll while disconnected, and any failure
+    drops the interface so the next pass rebuilds it.
     """
 
     def __init__(self):
         self.iface = None
         self.cookie = None
+        self.status = EdgeLog()
+
+    def probe(self):
+        """Try to reach the screensaver service. Cheap, and safe to call often.
+
+        get_object() introspects, so it fails fast and loudly while the service
+        is absent rather than handing back a proxy that only breaks later, when
+        a job has already started and it is too late to notice.
+        """
+        if self.iface is not None:
+            return True
         try:
             import dbus
 
@@ -151,28 +179,49 @@ class Inhibitor:
                 "org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver"
             )
             self.iface = dbus.Interface(obj, "org.freedesktop.ScreenSaver")
+            self.status.note(
+                True, "screensaver inhibit available; overlay will be held off "
+                      "during a job"
+            )
+            return True
         except Exception as exc:
-            log(f"screensaver inhibit unavailable ({exc}); falling back to xset only")
+            self.status.note(
+                False,
+                f"screensaver inhibit unavailable ({exc}); xset only, so the "
+                "overlay may appear over a running job. Retrying every poll.",
+            )
+            return False
+
+    def _drop(self):
+        """Forget the connection so the next probe() rebuilds it."""
+        self.iface = None
+        self.cookie = None
+        self.status = EdgeLog()
 
     def acquire(self):
-        if self.iface is None or self.cookie is not None:
+        if self.cookie is not None:
+            return
+        if not self.probe():
             return
         try:
             self.cookie = self.iface.Inhibit(
                 "cncpc-display-guard", "LinuxCNC program running"
             )
         except Exception as exc:
+            # Most likely the session went away between probe and call. Drop
+            # everything rather than retrying against a dead proxy forever.
             log(f"inhibit failed: {exc}")
-            self.cookie = None
+            self._drop()
 
     def release(self):
         if self.iface is None or self.cookie is None:
             return
         try:
             self.iface.UnInhibit(self.cookie)
+            self.cookie = None
         except Exception as exc:
             log(f"uninhibit failed: {exc}")
-        self.cookie = None
+            self._drop()
 
 
 class MachineState:
@@ -290,6 +339,12 @@ def main():
             # DPMS from gsettings whenever the session idle state changes, so
             # edge-triggering alone would lose the panel to a race it cannot
             # see. Re-applying is idempotent and costs one xset per poll.
+            # Probed every pass while disconnected, not once at startup. The
+            # graphical session normally appears well after this service does,
+            # and an inhibit that gave up before the session existed is an
+            # inhibit that never works.
+            inhibitor.probe()
+
             if busy:
                 inhibitor.acquire()
                 reached = apply_busy()
