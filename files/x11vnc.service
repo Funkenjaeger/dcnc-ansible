@@ -9,7 +9,13 @@ Type=simple
 ExecStart=x11vnc -xkb -noxrecord -noxfixes -noxdamage -display :0 -rfbport 5900 -auth guess -rfbauth /etc/x11vnc.pass -forever -avahi
 ExecStop=/usr/bin/killall x11vnc
 Restart=on-failure
-Restart-sec=2
+# RestartSec, not Restart-sec. Spelled with a hyphen this unit carried a key
+# systemd does not know, and systemd's response to an unknown key is to log
+# "Unknown key name 'Restart-sec' in section 'Service', ignoring." and carry
+# on -- so the setting was silently absent and this service restarted with the
+# 100ms default, not the 2s intended. Fixed 2026-09-07; confirmed with
+# `systemd-analyze verify`, which names the bad key directly.
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target

@@ -27,9 +27,11 @@ Environment=CNCPC_BLANK_SECS={{ cncpc_display_blank_secs }}
 Environment=CNCPC_POLL_SECS={{ cncpc_display_poll_secs }}
 ExecStart=/usr/local/bin/cncpc-display-guard
 # Restart=always, not on-failure: a clean exit here is still a display with
-# nothing watching it. RestartSec spelled correctly on purpose -- cf.
-# files/x11vnc.service, which carries "Restart-sec=2" and therefore has no
-# restart delay at all.
+# nothing watching it. RestartSec spelled correctly on purpose -- its neighbour
+# files/x11vnc.service carried "Restart-sec=2" for as long as it existed, which
+# systemd logs as an unknown key and ignores, leaving the 100ms default in
+# place of the 2s intended. Fixed 2026-09-07. `systemd-analyze verify <unit>`
+# catches that class of typo and costs nothing.
 Restart=always
 RestartSec=5
 
