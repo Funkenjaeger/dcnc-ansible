@@ -521,8 +521,17 @@
         owner: root
         group: root
         mode: '0644'
+      # 'reload user systemd', NOT the 'reload systemd' handler this used to
+      # notify. That one runs daemon_reload against the SYSTEM manager, and
+      # this is a USER unit in /etc/systemd/user/, which only user managers
+      # read -- so it did nothing here, and cncpc reported
+      #   "The unit file ... changed on disk. Run 'systemctl --user daemon-reload'"
+      # on the very next restart. Left alone, a change to
+      # cncpc_display_blank_secs would rewrite the unit, restart the service,
+      # and come back up on the STALE Environment= values with no error
+      # anywhere -- new timeouts on disk, old timeouts in effect.
       notify:
-        - reload systemd
+        - reload user systemd
         - restart display guard
 
     # --global, not --user. Enabling a user unit the ordinary way needs a live
@@ -1182,6 +1191,18 @@
       ansible.builtin.systemd:
         name: x11vnc
         state: restarted
+
+    # Defined BEFORE 'restart display guard' on purpose: ansible runs handlers
+    # in the order they are DEFINED here, not the order they were notified, so
+    # the reload has to sit above the restart or the restart picks up the unit
+    # the reload was meant to refresh.
+    - name: reload user systemd
+      ansible.builtin.command:
+        cmd: systemctl --user daemon-reload
+      become: no
+      register: user_daemon_reload
+      changed_when: user_daemon_reload.rc == 0
+      failed_when: false
 
     # become: no because this is a USER unit -- `systemctl --user` as root
     # addresses root's manager, which is not the one running the guard.
