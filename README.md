@@ -140,7 +140,13 @@ and looks green. Check the recap names a host before believing a clean run.
 
 ### 🛠️ System Hardening & Updates
 10. **disable initramfs automatic updates** - Set `update_initramfs=no` to prevent boot issues
-11. **update package lists and upgrade system** - Run `apt update && apt upgrade -y` safely
+11. **refresh the apt cache** - `apt-get update` once, tolerantly; every later apt task uses `update_cache: no`
+12. **work out which repos failed to refresh** - Parse `Err:` lines out of the output
+13. **split those into load-bearing and incidental** - Against `cncpc_apt_required_hosts`
+14. **fail when a repo this playbook installs from could not be refreshed** - Fatal, and named
+15. **fail when apt-get update broke in a way this cannot attribute** - Nonzero exit, no `Err:` line
+16. **report third-party repos that could not be refreshed** - Reported; the run continues
+17. **upgrade the system** - `apt-get upgrade --with-new-pkgs -y`
 
 ### 🌐 Network Configuration (Conditional)
 12. **check if any interface has IP 10.10.10.11** - Detect existing Mesa network configuration
@@ -149,7 +155,7 @@ and looks green. Check the recap names a host before believing a clean run.
 15. **configure selected interface with Mesa IP** - Set up Mesa network connection (if needed)
 
 ### 📦 Package Installation
-16. **install required packages** - Install: git, cinnamon, x11vnc
+**install required packages** - git, cinnamon, x11vnc, x11-xserver-utils, python3-dbus
 
 ### 🖥️ Desktop Environment Setup
 17. **set cinnamon as default session manager** - Configure lightdm for Cinnamon
@@ -289,6 +295,62 @@ journalctl --user -fu cncpc-display-guard.service
 - **Services**: brltty services disabled (interfere with USB devices)
 - **Updates**: Safe upgrade process after system hardening
 
+#### The apt cache, and why one dead repo no longer stops a rebuild
+
+Added 2026-09-07, after a third-party repo halted a whole provisioning run.
+
+QtPyVCP rotated the signing key on their `develop` repo on 2026-09-01. cncpc
+still had the old one, so the `InRelease` signature stopped verifying.
+`apt-get update` treats that as a **warning** — it keeps the previous index for
+that repo, reports every other repo as `Hit`, and **exits 0**.
+`ansible.builtin.apt`'s `update_cache` does not: it calls python-apt's
+`cache.update()`, which raises if *any* index fails to fetch. So a repo that
+nothing is installed from killed `install required packages`, five retries
+deep, with:
+
+```
+Failed to update apt cache after 5 retries:
+```
+
+Note the empty reason — that message is the module's, not apt's. The run died
+at a task unconnected to the broken repo, and named neither the repo nor the
+key. Diagnosing it meant running `apt-get update` by hand to see what Ansible
+had swallowed.
+
+The cache is now refreshed **once**, and failures are classified rather than
+treated alike:
+
+| What failed | What happens |
+|---|---|
+| A repo in `cncpc_apt_required_hosts` | **Fatal**, and the repo is named |
+| Any other repo | Reported; the run continues |
+| `apt-get update` exits nonzero with no `Err:` line | **Fatal**, full output shown |
+
+Every `ansible.builtin.apt` task carries `update_cache: no` and leans on that
+one task. The point is to put the judgement about which repos are load-bearing
+in **one readable place**, instead of spread across four tasks that each fail
+the same undifferentiated way. Debian being unreachable means the packages
+cannot be installed and the run is worthless; a third-party repo being
+unreachable means a rotated key, a dead domain, or a source the machine no
+longer uses — worth *saying*, never worth aborting a machine-tool rebuild over.
+
+**This logic is tested, because reading it was not enough to get it right.**
+
+```bash
+python3 tests/test_apt_classification.py
+```
+
+Written with single backslashes, `regex_replace(..., '\1')` looks correct in
+YAML — but Jinja reads `'\1'` as a *Python* string escape and hands the regex
+the control character `0x01` instead of a backreference. Every failed repo
+collapsed to the same unmatchable string and sorted into the *incidental*
+bucket, so a dead Debian mirror would have been tolerated and the run would
+have continued into an install it could not perform: the exact failure this
+block exists to prevent, reintroduced one escape level down. Nothing about it
+looks wrong on the page. Rendering the expressions against real apt output
+caught it on the first run. `--syntax-check` cannot — it validates YAML shape
+and never renders a template.
+
 ## File Structure
 
 ```
@@ -303,6 +365,8 @@ dcnc-ansible/
 ├── templates/               # Templated files
 │   ├── cncpc-display-guard.service.j2  # user unit for the display guard
 │   └── cncpc-restic-backup.sh.j2       # restic backup/prune script
+├── tests/                   # Runnable checks (no ansible required)
+│   └── test_apt_classification.py      # proves the apt-failure classification
 └── .gitignore              # Git ignore rules
 ```
 

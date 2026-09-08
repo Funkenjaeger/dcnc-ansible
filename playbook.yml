@@ -32,6 +32,20 @@
     # subprocess-free status polls and at most two xset calls per tick.
     cncpc_display_poll_secs: 10
 
+    # Repos this playbook actually INSTALLS FROM. A refresh failure on one of
+    # these aborts the run; a failure on anything else is reported and the run
+    # continues. See the APT CACHE REFRESH block below for why that
+    # distinction exists and what it cost to learn.
+    #
+    # Everything installed here -- git, cinnamon, x11vnc, x11-xserver-utils,
+    # python3-dbus, python3-venv, ethtool, restic, nfs-common, the RT kernel --
+    # comes from Debian proper. cncpc also carries EtherLab and QtPyVCP
+    # sources that no task in this playbook installs from, and those are
+    # precisely the ones that must not be able to stop a rebuild.
+    cncpc_apt_required_hosts:
+      - deb.debian.org
+      - security.debian.org
+
     # WHERE THE RESTIC BACKUP LIVES. Defaults ARE the production values, so an
     # un-overridden run behaves exactly as before -- the template renders
     # byte-identical to the script these replaced, and that is asserted rather
@@ -173,11 +187,133 @@
         line: "update_initramfs=no"
         backup: yes
 
-    - name: update package lists and upgrade system
-      ansible.builtin.shell:
-        cmd: "apt update && apt upgrade -y"
+    # ==========================================================================
+    # APT CACHE REFRESH -- added 2026-09-07, after a third-party repo whose
+    # signing key had rotated halted an entire provisioning run.
+    #
+    # WHAT HAPPENED. QtPyVCP rotated the signing key on their `develop` repo on
+    # 2026-09-01; cncpc still carried the old one, so the InRelease signature
+    # stopped verifying. `apt-get update` treats that as a WARNING -- it keeps
+    # the previous index for that repo, reports every other repo as Hit, and
+    # EXITS 0. ansible.builtin.apt's update_cache does not: it calls python-apt's
+    # cache.update(), which raises if ANY index fails to fetch. So a repo that
+    # nothing is installed from killed `install required packages`, five
+    # retries deep, with
+    #     "Failed to update apt cache after 5 retries: "
+    # -- note the empty reason. That is the module's message, not apt's. The
+    # run died at a task with no connection to the broken repo, and the error
+    # named neither the repo nor the key. Diagnosing it meant running
+    # `apt-get update` by hand to see what ansible had swallowed.
+    #
+    # THE POLICY. Refresh ONCE, here, with apt-get, and CLASSIFY what failed
+    # instead of treating every failure alike:
+    #   - a repo in cncpc_apt_required_hosts fails  -> FATAL, and named
+    #   - any other repo fails                      -> reported, run continues
+    #   - apt-get fails with no Err: lines to read  -> FATAL, output shown
+    # Every ansible.builtin.apt task below therefore carries `update_cache: no`
+    # and leans on this one. That is the point: it puts the judgement about
+    # which repos are load-bearing in ONE readable place, rather than spread
+    # across four tasks that each fail the same undifferentiated way.
+    #
+    # The distinction is a real one, not a convenience. Debian being
+    # unreachable means the packages below cannot be installed and the run is
+    # worthless. A third-party repo being unreachable means a rotated key, a
+    # dead domain, or a source the machine no longer uses -- worth SAYING, and
+    # never worth aborting a machine-tool rebuild over.
+    # ==========================================================================
+    - name: refresh the apt cache
+      ansible.builtin.command:
+        cmd: apt-get update
+      register: apt_update
+      changed_when: false
+      failed_when: false
+
+    - name: work out which repos failed to refresh
+      ansible.builtin.set_fact:
+        # An Err: line looks like
+        #   Err:3 https://repository.qtpyvcp.com/apt develop InRelease
+        # with the reason on an indented continuation line beneath it.
+        #
+        # THE BACKSLASHES ARE DOUBLED ON PURPOSE. A YAML block scalar passes
+        # them through literally, but Jinja then reads '\1' as a PYTHON string
+        # escape and hands regex_replace the control character 0x01 instead of
+        # a backreference. Written singly, every Err: line collapsed to
+        # "\x01", which matches no required host -- so a dead Debian mirror
+        # sorted into the INCIDENTAL bucket and the run carried on into an
+        # install it could not perform. That is the failure this whole block
+        # exists to prevent, reintroduced one escape level down. Caught by
+        # rendering these expressions against real apt output rather than by
+        # reading them; nothing about the single-backslash version looks wrong.
+        apt_failed_repos: >-
+          {{ apt_update.stdout_lines
+             | select('match', '^Err:')
+             | map('regex_replace', '^Err:\\S*\\s+(\\S+).*$', '\\1')
+             | list }}
+        apt_required_pattern: >-
+          {{ cncpc_apt_required_hosts | map('regex_escape') | join('|') }}
+
+    - name: split those into load-bearing and incidental
+      ansible.builtin.set_fact:
+        apt_failed_required: >-
+          {{ apt_failed_repos | select('search', apt_required_pattern) | list }}
+        apt_failed_optional: >-
+          {{ apt_failed_repos | reject('search', apt_required_pattern) | list }}
+
+    - name: fail when a repo this playbook installs from could not be refreshed
+      ansible.builtin.fail:
+        msg: >-
+          Could not refresh {{ apt_failed_required | join(', ') }}, which this
+          playbook installs from. Continuing would install from a stale cache
+          or not at all, so this stops here rather than producing a machine
+          that looks provisioned and is not. apt-get update reported:
+          {{ apt_update.stdout_lines | select('match', '^(Err|E):') | join(' // ') }}
+          {{ apt_update.stderr_lines | select('match', '^(W|E):') | join(' // ') }}
+      when: apt_failed_required | length > 0
+
+    - name: fail when apt-get update broke in a way this cannot attribute
+      ansible.builtin.fail:
+        msg: >-
+          apt-get update exited {{ apt_update.rc }} but printed no Err: line to
+          blame a repo for, so this cannot tell whether the packages below are
+          installable. Refusing to guess. Output:
+          {{ apt_update.stdout | default('') }} {{ apt_update.stderr | default('') }}
+      when:
+        - apt_update.rc != 0
+        - apt_failed_repos | length == 0
+
+    - name: report third-party repos that could not be refreshed
+      ansible.builtin.debug:
+        msg: >-
+          SKIPPED and continuing: {{ apt_failed_optional | join(', ') }} could
+          not be refreshed, and no task in this playbook installs from them.
+          Nothing here is broken by that today. A rotated signing key is the
+          usual cause -- QtPyVCP did exactly this on 2026-09-01 -- and it does
+          not fix itself. Either re-import the key, or retire the source the
+          way linuxcnc-uspace.list already is:
+          sudo mv /etc/apt/sources.list.d/NAME.list{,.disabled}
+      when: apt_failed_optional | length > 0
+
+    - name: upgrade the system
+      ansible.builtin.command:
+        cmd: apt-get upgrade --with-new-pkgs -y
+      environment:
+        DEBIAN_FRONTEND: noninteractive
       register: apt_upgrade_result
-      changed_when: "'upgraded' in apt_upgrade_result.stdout"
+      # --with-new-pkgs is NOT an addition. This replaced `apt upgrade -y`, and
+      # `apt upgrade` IS `apt-get upgrade --with-new-pkgs`; dropping the flag
+      # would have silently held back every upgrade needing a new dependency.
+      #
+      # The old changed_when was "'upgraded' in apt_upgrade_result.stdout",
+      # which is true of EVERY apt run -- "0 upgraded, 0 newly installed"
+      # contains the word. This task has reported `changed` on every pass since
+      # it was written, and that is why its `changed` told us nothing when the
+      # run above failed one task later. Test for the no-op line instead, and
+      # treat output we do not recognise as changed: over-reporting a change is
+      # the safe direction.
+      changed_when: >-
+        apt_upgrade_result.stdout_lines
+        | select('match', '^0 upgraded, 0 newly installed')
+        | list | length == 0
 
     - name: check if any interface has IP 10.10.10.11
       ansible.builtin.shell:
@@ -285,7 +421,11 @@
           - x11-xserver-utils
           - python3-dbus
         state: present
-        update_cache: yes
+        # Refreshed once by 'refresh the apt cache' above, on purpose. This
+        # task is where update_cache: yes died on a rotated QtPyVCP key it had
+        # nothing to do with; see the APT CACHE REFRESH block for the whole
+        # story. Every apt task below follows the same rule.
+        update_cache: no
 
 
     - name: set cinnamon as default session manager
@@ -657,7 +797,8 @@
       ansible.builtin.apt:
         name: python3-venv
         state: present
-        update_cache: yes
+        # See 'refresh the apt cache' near the top of this play.
+        update_cache: no
 
     - name: create python virtual environment
       ansible.builtin.command:
@@ -717,7 +858,8 @@
           - restic
           - nfs-common
         state: present
-        update_cache: yes
+        # See 'refresh the apt cache' near the top of this play.
+        update_cache: no
 
     - name: mount cncpc-restic NFS share
       ansible.posix.mount:
